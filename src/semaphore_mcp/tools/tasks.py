@@ -451,6 +451,50 @@ class TaskTools(BaseTool):
         except Exception as e:
             self.handle_error(e, f"stopping task {task_id}")
 
+    async def confirm_task(self, project_id: int, task_id: int) -> dict[str, Any]:
+        """Confirm a parked task, applying its plan.
+
+        WARNING: Semaphore re-plans and applies at confirm time — it does not
+        simply replay the plan output you reviewed via get_task_raw_output.
+        If the template runs against shared state without a saved plan file
+        (e.g. `-target` was only passed at plan time, not pinned to a saved
+        plan applied via `apply tfplan`), the apply at confirm time can
+        converge a far larger scope than what was reviewed. Verify the
+        template's apply phase carries the identical scope as the plan before
+        confirming; when in doubt, reject instead.
+
+        Args:
+            project_id: ID of the project
+            task_id: ID of the parked task to confirm
+
+        Returns:
+            Task confirm result
+        """
+        try:
+            return self.semaphore.confirm_task(project_id, task_id)
+        except Exception as e:
+            self.handle_error(e, f"confirming task {task_id}")
+
+    async def reject_task(self, project_id: int, task_id: int) -> dict[str, Any]:
+        """Reject a parked task, leaving its plan unapplied.
+
+        The task moves to an error state and nothing is applied. Use this
+        whenever a reviewed plan (via get_task_raw_output) shows a scope wider
+        than intended, or when confirm_task's re-plan-at-apply risk cannot be
+        ruled out.
+
+        Args:
+            project_id: ID of the project
+            task_id: ID of the parked task to reject
+
+        Returns:
+            Task reject result
+        """
+        try:
+            return self.semaphore.reject_task(project_id, task_id)
+        except Exception as e:
+            self.handle_error(e, f"rejecting task {task_id}")
+
     async def filter_tasks(
         self,
         project_id: int,

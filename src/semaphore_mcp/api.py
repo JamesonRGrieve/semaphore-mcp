@@ -854,6 +854,37 @@ class SemaphoreAPIClient:
         """Stop a running task."""
         return self._request("POST", f"project/{project_id}/tasks/{task_id}/stop")
 
+    def confirm_task(self, project_id: int, task_id: int) -> dict[str, Any]:
+        """Confirm a parked task, applying its plan.
+
+        Used with the plan-then-apply gate: a template configured to require
+        confirmation stops after producing a plan and waits in this parked
+        state until confirmed or rejected. Confirming re-plans and applies at
+        confirm time, it does not simply replay the previously reviewed plan.
+
+        Args:
+            project_id: Project ID
+            task_id: Task ID of the parked task
+
+        Returns:
+            Empty dict on success (204 response)
+        """
+        return self._request("POST", f"project/{project_id}/tasks/{task_id}/confirm")
+
+    def reject_task(self, project_id: int, task_id: int) -> dict[str, Any]:
+        """Reject a parked task, leaving its plan unapplied.
+
+        The task transitions to an error state and nothing is applied.
+
+        Args:
+            project_id: Project ID
+            task_id: Task ID of the parked task
+
+        Returns:
+            Empty dict on success (204 response)
+        """
+        return self._request("POST", f"project/{project_id}/tasks/{task_id}/reject")
+
     def get_last_tasks(self, project_id: int) -> list[dict[str, Any]]:
         """Get last 200 tasks for a project (more efficient than full list)."""
         result = self._request("GET", f"project/{project_id}/tasks/last")
