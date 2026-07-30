@@ -343,6 +343,26 @@ class TestSemaphoreAPIClientComprehensive:
             result = mock_client.stop_task(1, 1)
             assert result == mock_response
 
+    def test_confirm_task(self, mock_client):
+        """Test confirm_task method hits the confirm endpoint."""
+        mock_response = {}
+        with patch.object(
+            mock_client, "_request", return_value=mock_response
+        ) as mock_request:
+            result = mock_client.confirm_task(1, 1)
+            assert result == mock_response
+            mock_request.assert_called_once_with("POST", "project/1/tasks/1/confirm")
+
+    def test_reject_task(self, mock_client):
+        """Test reject_task method hits the reject endpoint."""
+        mock_response = {}
+        with patch.object(
+            mock_client, "_request", return_value=mock_response
+        ) as mock_request:
+            result = mock_client.reject_task(1, 1)
+            assert result == mock_response
+            mock_request.assert_called_once_with("POST", "project/1/tasks/1/reject")
+
     def test_get_last_tasks_dict_response(self, mock_client):
         """Test get_last_tasks when API returns dict instead of list."""
         mock_response = {"tasks": [{"id": 1, "status": "success"}]}

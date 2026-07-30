@@ -316,6 +316,46 @@ class TestTaskTools:
         task_tools.semaphore.stop_task.assert_called_once_with(1, 123)
 
     @pytest.mark.asyncio
+    async def test_confirm_task(self, task_tools):
+        """Test confirming a parked task applies its plan."""
+        task_tools.semaphore.confirm_task.return_value = {"status": "success"}
+
+        result = await task_tools.confirm_task(1, 123)
+
+        assert result == {"status": "success"}
+        task_tools.semaphore.confirm_task.assert_called_once_with(1, 123)
+
+    @pytest.mark.asyncio
+    async def test_confirm_task_error(self, task_tools):
+        """Test confirm_task surfaces API errors via handle_error."""
+        task_tools.semaphore.confirm_task.side_effect = requests.exceptions.HTTPError(
+            "404 Not Found"
+        )
+
+        with pytest.raises(RuntimeError):
+            await task_tools.confirm_task(1, 123)
+
+    @pytest.mark.asyncio
+    async def test_reject_task(self, task_tools):
+        """Test rejecting a parked task leaves it unapplied."""
+        task_tools.semaphore.reject_task.return_value = {"status": "error"}
+
+        result = await task_tools.reject_task(1, 123)
+
+        assert result == {"status": "error"}
+        task_tools.semaphore.reject_task.assert_called_once_with(1, 123)
+
+    @pytest.mark.asyncio
+    async def test_reject_task_error(self, task_tools):
+        """Test reject_task surfaces API errors via handle_error."""
+        task_tools.semaphore.reject_task.side_effect = requests.exceptions.HTTPError(
+            "404 Not Found"
+        )
+
+        with pytest.raises(RuntimeError):
+            await task_tools.reject_task(1, 123)
+
+    @pytest.mark.asyncio
     async def test_bulk_stop_tasks_confirmation(self, task_tools):
         """Test bulk stop tasks requires confirmation."""
         # Mock task details for confirmation
