@@ -290,7 +290,7 @@ class TestTaskExecutionE2E:
             {
                 "template_id": template["id"],
                 "project_id": project_id,
-                "arguments": "-v",  # Verbose flag
+                "arguments": ["-v"],  # Verbose flag
             },
         )
         data = parse_mcp_response(result)
@@ -337,7 +337,7 @@ class TestTaskExecutionE2E:
             {
                 "template_id": template["id"],
                 "project_id": project_id,
-                "arguments": "-e body='Hello from E2E test'",
+                "arguments": ["-e", "body='Hello from E2E test'"],
                 "follow": True,  # Wait to see completion
             },
         )
@@ -497,7 +497,7 @@ class TestTaskExecutionE2E:
             {
                 "template_id": template["id"],
                 "project_id": project_id,
-                "arguments": "-e sleep_seconds=60",  # Long sleep so we can stop it
+                "arguments": ["-e", "sleep_seconds=60"],  # Long sleep so we can stop it
             },
         )
         run_data = parse_mcp_response(run_result)
@@ -527,7 +527,7 @@ class TestTaskExecutionE2E:
             {
                 "template_id": template["id"],
                 "project_id": project_id,
-                "arguments": "-e sleep_seconds=30",
+                "arguments": ["-e", "sleep_seconds=30"],
             },
         )
         run_data = parse_mcp_response(run_result)
@@ -569,7 +569,7 @@ class TestTaskExecutionE2E:
             {
                 "template_id": template["id"],
                 "project_id": project_id,
-                "arguments": "-e sleep_seconds=30",
+                "arguments": ["-e", "sleep_seconds=30"],
             },
         )
         run_data = parse_mcp_response(run_result)
