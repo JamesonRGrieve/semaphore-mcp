@@ -7,12 +7,49 @@ This module provides tools for interacting with Semaphore tasks.
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any, Optional, Union
 
 import requests  # type: ignore
 
 from .base import BaseTool
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+_PLAN_MARKERS = (
+    "Plan:",
+    "No changes.",
+    "Changes to Outputs",
+    "will be created",
+    "will be updated",
+    "will be destroyed",
+    "will be read",
+    "must be replaced",
+)
+
+
+def _compact_plan_output(raw: str) -> str:
+    """Strip ANSI codes and extract the tofu plan section from task output."""
+    clean = _ANSI_RE.sub("", raw)
+    lines = clean.splitlines()
+    plan_lines: list[str] = []
+    in_plan = False
+    for line in lines:
+        stripped = line.strip()
+        if any(m in stripped for m in _PLAN_MARKERS):
+            in_plan = True
+        if stripped.startswith("Warning:") and "Resource targeting" in stripped:
+            in_plan = True
+        if in_plan:
+            plan_lines.append(line)
+        if in_plan and (
+            stripped.startswith("Plan:") or stripped.startswith("No changes.")
+        ):
+            plan_lines.append(line if line not in plan_lines else "")
+            break
+    if plan_lines:
+        return "\n".join(l for l in plan_lines if l).strip()
+    return clean.strip()
 
 logger = logging.getLogger(__name__)
 
@@ -936,18 +973,25 @@ class TaskTools(BaseTool):
                 "consecutive_errors": consecutive_errors,
             }
 
-    async def get_task_raw_output(self, project_id: int, task_id: int) -> str:
-        """Get raw output from a completed task for LLM analysis.
+    async def get_task_raw_output(
+        self, project_id: int, task_id: int, compact: bool = True
+    ) -> str:
+        """Get task output. By default strips ANSI codes and extracts the plan summary.
 
         Args:
             project_id: ID of the project
             task_id: ID of the task
+            compact: Strip ANSI escape codes and extract the tofu plan section
+                     (resource changes + summary). Set to false for full raw output.
 
         Returns:
-            Raw task output as plain text
+            Task output as plain text (compact plan summary by default)
         """
         try:
-            return self.semaphore.get_task_raw_output(project_id, task_id)
+            raw = self.semaphore.get_task_raw_output(project_id, task_id)
+            if not compact:
+                return raw
+            return _compact_plan_output(raw)
         except Exception as e:
             self.handle_error(e, f"getting raw output for task {task_id}")
 
