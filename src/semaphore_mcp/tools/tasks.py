@@ -231,7 +231,7 @@ class TaskTools(BaseTool):
             playbook: Override playbook file path
             git_branch: Override git branch to use
             message: Task description/message
-            arguments: Additional CLI arguments as a list of strings (e.g. ["-target=module.foo"])
+            arguments: Additional CLI arguments. MUST be a JSON array of strings, NOT a string. Example: ["-target=module.foo", "-refresh=false"]. Do NOT pass a JSON-encoded string like '["..."]' — pass the actual array.
             inventory_id: Override inventory to use
             follow: Enable 30-second monitoring for startup verification (default: False)
 
