@@ -16,39 +16,42 @@ import requests  # type: ignore
 from .base import BaseTool
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
-_PLAN_MARKERS = (
-    "Plan:",
-    "No changes.",
-    "Changes to Outputs",
-    "will be created",
-    "will be updated",
-    "will be destroyed",
-    "will be read",
-    "must be replaced",
-)
+_RESOURCE_COMMENT_RE = re.compile(r"^\s*#\s+\S+.*\b(will be|must be)\b")
+_PLAN_SUMMARY_RE = re.compile(r"^\s*Plan:\s+\d+")
+_NO_CHANGES_RE = re.compile(r"^\s*No changes\.")
+_OUTPUT_CHANGE_RE = re.compile(r"^\s*Changes to Outputs:")
+_WARNING_RE = re.compile(r"^\s*Warning:")
 
 
 def _compact_plan_output(raw: str) -> str:
-    """Strip ANSI codes and extract the tofu plan section from task output."""
+    """Strip ANSI and extract resource change headers + plan summary only.
+
+    From a full tofu plan log, extracts:
+      - Each '# resource.name will be created/updated/destroyed' line
+      - 'Changes to Outputs:' marker
+      - 'Plan: N to add, N to change, N to destroy' summary
+      - 'No changes.' if applicable
+      - Warning lines (e.g. resource targeting)
+    Skips the full diff blocks (~, +, - lines) that make up 95% of the output.
+    """
     clean = _ANSI_RE.sub("", raw)
-    lines = clean.splitlines()
-    plan_lines: list[str] = []
-    in_plan = False
-    for line in lines:
+    out: list[str] = []
+    for line in clean.splitlines():
         stripped = line.strip()
-        if any(m in stripped for m in _PLAN_MARKERS):
-            in_plan = True
-        if stripped.startswith("Warning:") and "Resource targeting" in stripped:
-            in_plan = True
-        if in_plan:
-            plan_lines.append(line)
-        if in_plan and (
-            stripped.startswith("Plan:") or stripped.startswith("No changes.")
-        ):
-            plan_lines.append(line if line not in plan_lines else "")
-            break
-    if plan_lines:
-        return "\n".join(l for l in plan_lines if l).strip()
+        if not stripped:
+            continue
+        if _RESOURCE_COMMENT_RE.match(line):
+            out.append(stripped)
+        elif _PLAN_SUMMARY_RE.match(line):
+            out.append(stripped)
+        elif _NO_CHANGES_RE.match(line):
+            out.append(stripped)
+        elif _OUTPUT_CHANGE_RE.match(line):
+            out.append(stripped)
+        elif _WARNING_RE.match(line):
+            out.append(stripped)
+    if out:
+        return "\n".join(out)
     return clean.strip()
 
 logger = logging.getLogger(__name__)
