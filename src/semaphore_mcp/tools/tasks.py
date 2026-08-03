@@ -493,6 +493,25 @@ class TaskTools(BaseTool):
         except Exception as e:
             self.handle_error(e, f"stopping task {task_id}")
 
+    async def delete_task(self, project_id: int, task_id: int) -> dict[str, Any]:
+        """Delete a queued/waiting task that was created erroneously.
+
+        Use this to remove tasks stuck in 'waiting' (queued, not yet running)
+        state. For tasks in 'waiting_confirmation' (parked plans), use
+        reject_task instead. For running tasks, use stop_task first.
+
+        Args:
+            project_id: ID of the project
+            task_id: ID of the task to delete
+
+        Returns:
+            Task delete result
+        """
+        try:
+            return self.semaphore.delete_task(project_id, task_id)
+        except Exception as e:
+            self.handle_error(e, f"deleting task {task_id}")
+
     async def confirm_task(self, project_id: int, task_id: int) -> dict[str, Any]:
         """Confirm a parked task, applying its plan.
 

@@ -135,6 +135,7 @@ class SemaphoreMCPServer:
         # Enhanced task tools - filtering and bulk operations
         self.mcp.tool()(self.task_tools.filter_tasks)
         self.mcp.tool()(self.task_tools.stop_task)
+        self.mcp.tool()(self.task_tools.delete_task)
         self.mcp.tool()(self.task_tools.bulk_stop_tasks)
         self.mcp.tool()(self.task_tools.get_waiting_tasks)
 
