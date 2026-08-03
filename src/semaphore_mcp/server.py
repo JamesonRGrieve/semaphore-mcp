@@ -52,8 +52,9 @@ class SemaphoreMCPServer:
         self.token = semaphore_token or get_config("SEMAPHORE_API_TOKEN")
         self.semaphore = create_client(self.url, self.token)
 
-        # Initialize MCPServer with host/port for HTTP transport
-        self.mcp = MCPServer("semaphore", host=host, port=port)
+        self.host = host
+        self.port = port
+        self.mcp = MCPServer("semaphore")
 
         # Initialize tool classes
         self.event_tools = EventTools(self.semaphore)
@@ -187,9 +188,9 @@ class SemaphoreMCPServer:
         logger.info(f"Starting MCPServer server for SemaphoreUI at {self.url}")
         if transport == "http":
             logger.info(
-                f"HTTP transport on {self.mcp.settings.host}:{self.mcp.settings.port}"
+                f"HTTP transport on {self.host}:{self.port}"
             )
-            self.mcp.run(transport="streamable-http")
+            self.mcp.run(transport="streamable-http", host=self.host, port=self.port)
         else:
             logger.info("STDIO transport")
             self.mcp.run(transport="stdio")
