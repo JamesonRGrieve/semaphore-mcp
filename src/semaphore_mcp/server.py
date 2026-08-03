@@ -1,14 +1,14 @@
 """
-FastMCP Server implementation for SemaphoreUI.
+MCPServer Server implementation for SemaphoreUI.
 
-This module implements a Model Context Protocol server using FastMCP that exposes
+This module implements a Model Context Protocol server using MCPServer that exposes
 SemaphoreUI API functionality through MCP tools.
 """
 
 import logging
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from .api import create_client
 from .config import configure_logging, get_config
@@ -29,7 +29,7 @@ logger = logging.getLogger("semaphore_mcp")
 
 
 class SemaphoreMCPServer:
-    """FastMCP server for SemaphoreUI."""
+    """MCPServer server for SemaphoreUI."""
 
     def __init__(
         self,
@@ -52,8 +52,8 @@ class SemaphoreMCPServer:
         self.token = semaphore_token or get_config("SEMAPHORE_API_TOKEN")
         self.semaphore = create_client(self.url, self.token)
 
-        # Initialize FastMCP with host/port for HTTP transport
-        self.mcp = FastMCP("semaphore", host=host, port=port)
+        # Initialize MCPServer with host/port for HTTP transport
+        self.mcp = MCPServer("semaphore", host=host, port=port)
 
         # Initialize tool classes
         self.event_tools = EventTools(self.semaphore)
@@ -184,7 +184,7 @@ class SemaphoreMCPServer:
         Args:
             transport: Transport type - "stdio" or "http"
         """
-        logger.info(f"Starting FastMCP server for SemaphoreUI at {self.url}")
+        logger.info(f"Starting MCPServer server for SemaphoreUI at {self.url}")
         if transport == "http":
             logger.info(
                 f"HTTP transport on {self.mcp.settings.host}:{self.mcp.settings.port}"
