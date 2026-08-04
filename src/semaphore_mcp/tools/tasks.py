@@ -256,9 +256,9 @@ class TaskTools(BaseTool):
         message: Optional[str] = None,
         arguments: Optional[list[str]] = None,
         inventory_id: Optional[int] = None,
-        follow: bool = False,
+        follow: int = 0,
     ) -> dict[str, Any]:
-        """Run a task from a template with optional 30-second monitoring.
+        """Run a task from a template and optionally wait for it to finish.
 
         Args:
             template_id: ID of the template to run
@@ -273,7 +273,7 @@ class TaskTools(BaseTool):
             message: Task description/message
             arguments: Additional CLI arguments. MUST be a JSON array of strings, NOT a string. Example: ["-target=module.foo", "-refresh=false"]. Do NOT pass a JSON-encoded string like '["..."]' — pass the actual array.
             inventory_id: Override inventory to use
-            follow: Enable 30-second monitoring for startup verification (default: False)
+            follow: Seconds to wait for the task to reach a terminal state (success, error, waiting_confirmation). 0 = return immediately (default). 300 = wait up to 5 minutes. The tool blocks until the task finishes or the timeout expires.
 
         Returns:
             Task execution result with immediate web URLs and optional monitoring summary
@@ -391,41 +391,28 @@ class TaskTools(BaseTool):
                     "next_steps": "Use the task_detail URL above to monitor progress in SemaphoreUI",
                 }
 
-                # If follow is False, return immediately with URLs
-                if not follow:
-                    response["monitoring"] = {
-                        "enabled": False,
-                        "message": "Use the web URL above to monitor task progress",
-                    }
+                if follow <= 0:
                     return response
 
-                # If follow is True, do 30-second smart monitoring
-                logger.info(
-                    f"Starting 30-second monitoring for task {task_id} in project {project_id}"
-                )
-
                 monitoring_result = await self._monitor_task_startup(
-                    project_id, task_id
+                    project_id, task_id, timeout=follow
                 )
 
                 response["monitoring"] = monitoring_result
 
-                # Update the message based on monitoring results
                 if monitoring_result.get("completed"):
                     final_status = monitoring_result.get("final_status")
                     if final_status in ["success", "successful"]:
                         response["message"] = f"Task #{task_id} completed successfully!"
+                    elif final_status == "waiting_confirmation":
+                        response["message"] = f"Task #{task_id} plan ready — waiting for confirm/reject."
                     elif final_status in ["error", "failed"]:
-                        response["message"] = (
-                            f"Task #{task_id} failed. Check logs via the URL above."
-                        )
+                        response["message"] = f"Task #{task_id} failed."
                     else:
-                        response["message"] = (
-                            f"Task #{task_id} finished with status: {final_status}"
-                        )
+                        response["message"] = f"Task #{task_id} finished with status: {final_status}"
                 else:
                     response["message"] = (
-                        f"Task #{task_id} is still running. Use the URL above for live progress."
+                        f"Task #{task_id} still running after {follow}s timeout."
                     )
 
                 return response
@@ -752,16 +739,17 @@ class TaskTools(BaseTool):
             self.handle_error(e, f"bulk restarting tasks for project {project_id}")
 
     async def _monitor_task_startup(
-        self, project_id: int, task_id: int
+        self, project_id: int, task_id: int, timeout: int = 300
     ) -> dict[str, Any]:
-        """Monitor task for 30 seconds to catch quick completions and startup issues.
+        """Poll task until it reaches a terminal state or timeout expires.
 
         Args:
             project_id: Project ID
             task_id: Task ID to monitor
+            timeout: Max seconds to wait (default 300)
 
         Returns:
-            Monitoring summary focused on startup verification
+            Monitoring summary
         """
         status_updates = []
         start_time = time.time()
@@ -770,12 +758,11 @@ class TaskTools(BaseTool):
         consecutive_errors = 0
         max_consecutive_errors = 3
 
-        # Fixed 30-second monitoring with 3-second intervals
-        monitoring_duration = 30
-        poll_interval = 3
-        max_polls = 10  # 30 seconds / 3 seconds = 10 polls
+        monitoring_duration = timeout
+        poll_interval = 5
+        max_polls = max(1, monitoring_duration // poll_interval)
 
-        logger.info(f"Starting 30-second startup monitoring for task {task_id}")
+        logger.info(f"Monitoring task {task_id} for up to {timeout}s")
 
         # Small initial delay to allow task to be created in API
         await asyncio.sleep(0.5)
@@ -810,13 +797,13 @@ class TaskTools(BaseTool):
                         )
                         last_status = current_status
 
-                    # Check if task completed
                     if current_status in [
                         "success",
                         "error",
                         "stopped",
                         "successful",
                         "failed",
+                        "waiting_confirmation",
                     ]:
                         # Get final output if available
                         output_available = False
@@ -889,13 +876,13 @@ class TaskTools(BaseTool):
                                         )
                                         last_status = current_status
 
-                                    # Check if complete
                                     if current_status in [
                                         "success",
                                         "error",
                                         "stopped",
                                         "successful",
                                         "failed",
+                                        "waiting_confirmation",
                                     ]:
                                         completion_msg = f"Task completed with status: {current_status} (via task list)"
                                         logger.info(completion_msg)
