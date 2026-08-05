@@ -21,17 +21,49 @@ _PLAN_SUMMARY_RE = re.compile(r"^\s*Plan:\s+\d+")
 _NO_CHANGES_RE = re.compile(r"^\s*No changes\.")
 _OUTPUT_CHANGE_RE = re.compile(r"^\s*Changes to Outputs:")
 _WARNING_RE = re.compile(r"^\s*Warning:")
+_ERROR_RE = re.compile(r"^\s*Error:\s")
+
+
+def _extract_error_blocks(clean: str) -> list[str]:
+    """Extract full error blocks from ANSI-stripped output.
+
+    An error block starts with a line matching 'Error: ...' and continues
+    through subsequent indented/prefixed lines until a blank line or the
+    next top-level marker. Captures the complete diagnostic so the caller
+    sees what actually broke without needing the full raw log.
+    """
+    blocks: list[str] = []
+    current: list[str] = []
+    in_block = False
+    for line in clean.splitlines():
+        stripped = line.strip()
+        if _ERROR_RE.match(stripped):
+            if current:
+                blocks.append("\n".join(current))
+            current = [stripped]
+            in_block = True
+        elif in_block:
+            if not stripped:
+                blocks.append("\n".join(current))
+                current = []
+                in_block = False
+            else:
+                current.append(stripped)
+    if current:
+        blocks.append("\n".join(current))
+    return blocks
 
 
 def _compact_plan_output(raw: str) -> str:
-    """Strip ANSI and extract resource change headers + plan summary only.
+    """Strip ANSI and extract resource change headers, plan summary, and errors.
 
-    From a full tofu plan log, extracts:
+    From a full tofu/ansible log, extracts:
       - Each '# resource.name will be created/updated/destroyed' line
       - 'Changes to Outputs:' marker
       - 'Plan: N to add, N to change, N to destroy' summary
       - 'No changes.' if applicable
       - Warning lines (e.g. resource targeting)
+      - Full error blocks (Error: ... through the end of the diagnostic)
     Skips the full diff blocks (~, +, - lines) that make up 95% of the output.
     """
     clean = _ANSI_RE.sub("", raw)
@@ -50,6 +82,11 @@ def _compact_plan_output(raw: str) -> str:
             out.append(stripped)
         elif _WARNING_RE.match(line):
             out.append(stripped)
+    errors = _extract_error_blocks(clean)
+    if errors:
+        out.append("")
+        out.append("--- Errors ---")
+        out.extend(errors)
     if out:
         return "\n".join(out)
     return clean.strip()
