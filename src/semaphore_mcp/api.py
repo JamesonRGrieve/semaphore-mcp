@@ -953,26 +953,34 @@ class SemaphoreAPIClient:
     ) -> dict[str, Any]:
         """Update an existing environment.
 
+        Merges env_data into the existing environment variables instead of
+        replacing them. Fetches the current state first so callers can add
+        a single key without wiping the rest.
+
         Args:
             project_id: Project ID
             environment_id: Environment ID
             name: Environment name (optional)
-            env_data: Environment variables as key-value pairs (optional)
+            env_data: Environment variables to merge (optional)
 
         Returns:
             Updated environment information
         """
-        # Include project_id and environment_id in payload to match SemaphoreUI API requirements
-        payload: dict[str, Any] = {"project_id": project_id, "id": environment_id}
+        current = self._request(
+            "GET", f"project/{project_id}/environment/{environment_id}"
+        )
+        payload: dict[str, Any] = {
+            "project_id": project_id,
+            "id": environment_id,
+            "name": name if name is not None else current.get("name", ""),
+            "json": current.get("json", "{}"),
+            "env": current.get("env") or "{}",
+        }
 
-        # Only update what's specified
-        if name is not None:
-            payload["name"] = name
-
-        # Encode environment variables if provided
         if env_data is not None:
-            # Use JSON format (modern SemaphoreUI versions)
-            payload["json"] = json.dumps(env_data)
+            existing = json.loads(payload["env"]) if payload["env"] else {}
+            existing.update(env_data)
+            payload["env"] = json.dumps(existing)
 
         return self._request(
             "PUT", f"project/{project_id}/environment/{environment_id}", json=payload
