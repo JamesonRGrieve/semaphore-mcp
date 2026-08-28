@@ -60,6 +60,8 @@ class SemaphoreAPIClient:
         """
         url = f"{self.base_url}/api/{endpoint}"
         kwargs.setdefault("timeout", self.request_timeout)
+        if method in ("POST", "PUT", "DELETE") and "json" not in kwargs and "data" not in kwargs:
+            kwargs["json"] = {}
         response = self.session.request(method, url, **kwargs)
 
         try:

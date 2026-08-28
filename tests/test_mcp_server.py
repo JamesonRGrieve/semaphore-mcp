@@ -322,7 +322,7 @@ class TestMCPServer:
                 f"Running template {template_id} with explicit project_id {project_id}"
             )
             result1 = await server.task_tools.run_task(
-                template_id, project_id=project_id
+                template_id, project_id=project_id, follow=0
             )
 
             # Verify response structure
@@ -334,7 +334,7 @@ class TestMCPServer:
             print(
                 f"Running template {template_id} with automatic project_id determination"
             )
-            result2 = await server.task_tools.run_task(template_id)
+            result2 = await server.task_tools.run_task(template_id, follow=0)
 
             # Verify response structure
             assert isinstance(result2, dict), "Expected result to be a dict"

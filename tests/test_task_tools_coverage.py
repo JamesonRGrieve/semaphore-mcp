@@ -75,7 +75,7 @@ class TestTaskToolsCoverage:
         task_tools.semaphore.list_templates.return_value = [{"id": 5, "name": "test"}]
         task_tools.semaphore.run_task.return_value = {"id": 10, "status": "started"}
 
-        result = await task_tools.run_task(5)  # No project_id provided
+        result = await task_tools.run_task(5, follow=0)  # No project_id provided
 
         assert result["task"]["id"] == 10
         # Verify it found the project and ran the task
@@ -104,7 +104,7 @@ class TestTaskToolsCoverage:
         task_tools.semaphore.list_templates.return_value = [{"id": 5, "name": "test"}]
         task_tools.semaphore.run_task.return_value = {"id": 10, "status": "started"}
 
-        result = await task_tools.run_task(5)
+        result = await task_tools.run_task(5, follow=0)
 
         assert result["task"]["id"] == 10
         task_tools.semaphore.run_task.assert_called_once_with(
@@ -132,7 +132,7 @@ class TestTaskToolsCoverage:
         }
         task_tools.semaphore.run_task.return_value = {"id": 10, "status": "started"}
 
-        result = await task_tools.run_task(5)
+        result = await task_tools.run_task(5, follow=0)
 
         assert result["task"]["id"] == 10
 
@@ -143,7 +143,7 @@ class TestTaskToolsCoverage:
         task_tools.semaphore.list_projects.return_value = [{"id": 1, "name": "test"}]
         task_tools.semaphore.list_templates.return_value = [{"id": 99, "name": "other"}]
 
-        result = await task_tools.run_task(5)
+        result = await task_tools.run_task(5, follow=0)
         assert "error" in result
         assert "Could not determine project_id" in result["error"]
 
@@ -165,7 +165,7 @@ class TestTaskToolsCoverage:
         task_tools.semaphore.run_task.return_value = {"id": 10, "status": "started"}
 
         # Should continue and find template in project 2
-        result = await task_tools.run_task(5)
+        result = await task_tools.run_task(5, follow=0)
         assert result["task"]["id"] == 10
 
     @pytest.mark.asyncio
@@ -181,7 +181,7 @@ class TestTaskToolsCoverage:
         task_tools.semaphore.run_task.side_effect = http_error
 
         result = await task_tools.run_task(
-            5, project_id=1, environment={"VAR": "value"}
+            5, project_id=1, environment={"VAR": "value"}, follow=0
         )
         assert "error" in result
         assert "HTTP error" in result["error"]
@@ -195,7 +195,7 @@ class TestTaskToolsCoverage:
         http_error = requests.exceptions.HTTPError("Network error")
         task_tools.semaphore.run_task.side_effect = http_error
 
-        result = await task_tools.run_task(5, project_id=1)
+        result = await task_tools.run_task(5, project_id=1, follow=0)
         assert "error" in result
         assert "HTTP error" in result["error"]
 
@@ -204,7 +204,7 @@ class TestTaskToolsCoverage:
         """Test run_task when general error occurs."""
         task_tools.semaphore.run_task.side_effect = Exception("General error")
 
-        result = await task_tools.run_task(5, project_id=1)
+        result = await task_tools.run_task(5, project_id=1, follow=0)
         assert "error" in result
         assert "Unexpected error" in result["error"]
 
@@ -377,18 +377,15 @@ class TestTaskToolsCoverage:
 
     @pytest.mark.asyncio
     async def test_run_task_no_follow(self, task_tools):
-        """Test run_task when follow=False."""
+        """Test run_task when follow=0 returns immediately without monitoring."""
         mock_task_result = {"id": 10, "status": "started"}
 
-        # Mock the semaphore client
         task_tools.semaphore.run_task = Mock(return_value=mock_task_result)
 
-        result = await task_tools.run_task(5, project_id=1, follow=False)
+        result = await task_tools.run_task(5, project_id=1, follow=0)
 
         assert "task" in result
-        assert "monitoring" in result
-        assert result["monitoring"]["enabled"] is False
-        # Verify semaphore client was called
+        assert "monitoring" not in result
         task_tools.semaphore.run_task.assert_called_once_with(
             1,
             5,
@@ -411,7 +408,7 @@ class TestTaskToolsCoverage:
 
         task_tools.semaphore.run_task = Mock(return_value=mock_task_result)
 
-        result = await task_tools.run_task(5, project_id=1, follow=True)
+        result = await task_tools.run_task(5, project_id=1, follow=0)
 
         assert "error" in result
         assert "Could not extract task ID" in result["error"]
@@ -422,7 +419,7 @@ class TestTaskToolsCoverage:
         # Mock empty projects list
         task_tools.semaphore.list_projects = Mock(return_value=[])
 
-        result = await task_tools.run_task(5, project_id=None, follow=False)
+        result = await task_tools.run_task(5, project_id=None, follow=0)
 
         assert "error" in result
         assert "Could not determine project_id" in result["error"]

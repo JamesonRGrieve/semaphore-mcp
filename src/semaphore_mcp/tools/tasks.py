@@ -23,6 +23,12 @@ _OUTPUT_CHANGE_RE = re.compile(r"^\s*Changes to Outputs:")
 _WARNING_RE = re.compile(r"^\s*Warning:")
 _ERROR_RE = re.compile(r"^\s*Error:\s")
 
+# Semaphore persists a task's `message` in a varchar(250) column, so a longer
+# value fails the /tasks POST with a Postgres 22001 ("value too long") that
+# surfaces as an opaque HTTP 500. The message is a human label, not load-bearing,
+# so clamp it defensively rather than let a long description sink the task.
+SEMAPHORE_MESSAGE_MAX = 250
+
 
 def _extract_error_blocks(clean: str) -> list[str]:
     """Extract full error blocks from ANSI-stripped output.
@@ -293,9 +299,9 @@ class TaskTools(BaseTool):
         message: Optional[str] = None,
         arguments: Optional[list[str]] = None,
         inventory_id: Optional[int] = None,
-        follow: int = 0,
+        follow: int = 600,
     ) -> dict[str, Any]:
-        """Run a task from a template and optionally wait for it to finish.
+        """Run a task from a template and wait for it to finish.
 
         Args:
             template_id: ID of the template to run
@@ -310,7 +316,7 @@ class TaskTools(BaseTool):
             message: Task description/message
             arguments: Additional CLI arguments. MUST be a JSON array of strings, NOT a string. Example: ["-target=module.foo", "-refresh=false"]. Do NOT pass a JSON-encoded string like '["..."]' — pass the actual array.
             inventory_id: Override inventory to use
-            follow: Seconds to wait for the task to reach a terminal state (success, error, waiting_confirmation). 0 = return immediately (default). 300 = wait up to 5 minutes. The tool blocks until the task finishes or the timeout expires.
+            follow: Max seconds to wait for the task to reach a terminal state (success, error, waiting_confirmation). Returns as soon as the task finishes — this is a ceiling, not a fixed wait. 0 = fire and forget (default 600).
 
         Returns:
             Task execution result with immediate web URLs and optional monitoring summary
@@ -390,6 +396,12 @@ class TaskTools(BaseTool):
 
             # Now run the task with the determined project_id
             try:
+                # Clamp an over-long message to Semaphore's varchar(250) message
+                # column so it can't fail the POST with an opaque HTTP 500.
+                message_truncated = False
+                if message and len(message) > SEMAPHORE_MESSAGE_MAX:
+                    message = message[: SEMAPHORE_MESSAGE_MAX - 3] + "..."
+                    message_truncated = True
                 arguments_json = json.dumps(arguments) if arguments else None
                 task_result = self.semaphore.run_task(
                     project_id,
@@ -427,6 +439,12 @@ class TaskTools(BaseTool):
                     "message": f"Task #{task_id} started successfully!",
                     "next_steps": "Use the task_detail URL above to monitor progress in SemaphoreUI",
                 }
+
+                if message_truncated:
+                    response["message_truncated"] = (
+                        f"Task message exceeded Semaphore's {SEMAPHORE_MESSAGE_MAX}-char column "
+                        "and was truncated; the task ran normally (message is a label only)."
+                    )
 
                 if follow <= 0:
                     return response
@@ -536,7 +554,9 @@ class TaskTools(BaseTool):
         except Exception as e:
             self.handle_error(e, f"deleting task {task_id}")
 
-    async def confirm_task(self, project_id: int, task_id: int) -> dict[str, Any]:
+    async def confirm_task(
+        self, project_id: int, task_id: int, follow: int = 600
+    ) -> dict[str, Any]:
         """Confirm a parked task, applying its plan.
 
         WARNING: Semaphore re-plans and applies at confirm time — it does not
@@ -551,12 +571,43 @@ class TaskTools(BaseTool):
         Args:
             project_id: ID of the project
             task_id: ID of the parked task to confirm
+            follow: Seconds to wait for the apply to finish (default 600). The tool returns as soon as the task reaches a terminal state (success, error). 0 = fire and forget.
 
         Returns:
-            Task confirm result
+            Confirm result with optional apply monitoring summary
         """
         try:
-            return self.semaphore.confirm_task(project_id, task_id)
+            # confirm returns 204 (empty); we build a richer response ourselves.
+            self.semaphore.confirm_task(project_id, task_id)
+
+            response: dict[str, Any] = {
+                "task_id": task_id,
+                "confirmed": True,
+                "message": f"Task #{task_id} confirmed — apply started.",
+            }
+
+            if follow <= 0:
+                return response
+
+            monitoring = await self._monitor_task_startup(
+                project_id, task_id, timeout=follow
+            )
+            response["monitoring"] = monitoring
+
+            if monitoring.get("completed"):
+                final_status = monitoring.get("final_status")
+                if final_status in ("success", "successful"):
+                    response["message"] = f"Task #{task_id} apply completed successfully."
+                elif final_status in ("error", "failed"):
+                    response["message"] = f"Task #{task_id} apply failed."
+                else:
+                    response["message"] = f"Task #{task_id} finished with status: {final_status}"
+            else:
+                response["message"] = (
+                    f"Task #{task_id} apply still running after {follow}s timeout."
+                )
+
+            return response
         except Exception as e:
             self.handle_error(e, f"confirming task {task_id}")
 
@@ -809,7 +860,6 @@ class TaskTools(BaseTool):
                 current_time = time.time()
                 elapsed = current_time - start_time
 
-                # Check if we've exceeded 30 seconds
                 if elapsed > monitoring_duration:
                     break
 
@@ -990,7 +1040,7 @@ class TaskTools(BaseTool):
             elapsed = current_time - start_time
 
             logger.info(
-                f"30-second monitoring completed for task {task_id}: {poll_count} polls, status: {last_status}"
+                f"Monitoring timed out for task {task_id}: {poll_count} polls, status: {last_status}"
             )
 
             return {

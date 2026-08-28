@@ -175,7 +175,7 @@ class TestTaskTools:
         task_tools.semaphore.run_task.return_value = mock_result
 
         # Call the method
-        result = await task_tools.run_task(template_id, project_id, environment)
+        result = await task_tools.run_task(template_id, project_id, environment, follow=0)
 
         # Verify the enhanced result format
         assert "task" in result
@@ -202,6 +202,30 @@ class TestTaskTools:
         )
 
     @pytest.mark.asyncio
+    async def test_run_task_truncates_overlong_message(self, task_tools):
+        """An over-long message is clamped to Semaphore's varchar(250) column so the
+        /tasks POST cannot fail with a Postgres 22001 → opaque HTTP 500; the task
+        still runs and the caller is told it was truncated."""
+        task_tools.semaphore.run_task.return_value = {"id": 7, "status": "scheduled"}
+
+        result = await task_tools.run_task(42, 1, message="x" * 400, follow=0)
+
+        sent = task_tools.semaphore.run_task.call_args.kwargs["message"]
+        assert len(sent) == 250
+        assert sent.endswith("...")
+        assert "message_truncated" in result
+
+    @pytest.mark.asyncio
+    async def test_run_task_short_message_untouched(self, task_tools):
+        """A message within the limit passes through verbatim with no truncation note."""
+        task_tools.semaphore.run_task.return_value = {"id": 8, "status": "scheduled"}
+
+        result = await task_tools.run_task(42, 1, message="short plan message", follow=0)
+
+        assert task_tools.semaphore.run_task.call_args.kwargs["message"] == "short plan message"
+        assert "message_truncated" not in result
+
+    @pytest.mark.asyncio
     async def test_run_task_without_project_id(self, task_tools):
         """Test run_task method without project_id (should look it up)."""
         # Set up mocks for project and template lookup
@@ -221,7 +245,7 @@ class TestTaskTools:
         task_tools.semaphore.run_task.return_value = mock_result
 
         # Call the method without project_id
-        result = await task_tools.run_task(template_id)
+        result = await task_tools.run_task(template_id, follow=0)
 
         # Verify the enhanced result format
         assert "task" in result
@@ -263,7 +287,7 @@ class TestTaskTools:
         task_tools.semaphore.run_task.side_effect = http_error
 
         # The method should return an error response
-        result = await task_tools.run_task(template_id, project_id, environment)
+        result = await task_tools.run_task(template_id, project_id, environment, follow=0)
 
         # Verify the error response
         assert "error" in result
@@ -318,11 +342,11 @@ class TestTaskTools:
     @pytest.mark.asyncio
     async def test_confirm_task(self, task_tools):
         """Test confirming a parked task applies its plan."""
-        task_tools.semaphore.confirm_task.return_value = {"status": "success"}
+        task_tools.semaphore.confirm_task.return_value = {}
 
-        result = await task_tools.confirm_task(1, 123)
+        result = await task_tools.confirm_task(1, 123, follow=0)
 
-        assert result == {"status": "success"}
+        assert result["confirmed"] is True
         task_tools.semaphore.confirm_task.assert_called_once_with(1, 123)
 
     @pytest.mark.asyncio
@@ -333,7 +357,7 @@ class TestTaskTools:
         )
 
         with pytest.raises(RuntimeError):
-            await task_tools.confirm_task(1, 123)
+            await task_tools.confirm_task(1, 123, follow=0)
 
     @pytest.mark.asyncio
     async def test_reject_task(self, task_tools):
@@ -431,15 +455,13 @@ class TestTaskTools:
         # Mock the semaphore client
         task_tools.semaphore.run_task = Mock(return_value=mock_task_result)
 
-        # Run task without monitoring (follow=False)
         result = await task_tools.run_task(
             template_id=template_id,
             project_id=project_id,
             environment=environment,
-            follow=False,
+            follow=0,
         )
 
-        # Verify semaphore client was called
         task_tools.semaphore.run_task.assert_called_once_with(
             project_id,
             template_id,
@@ -455,13 +477,11 @@ class TestTaskTools:
             inventory_id=None,
         )
 
-        # Check the result structure for immediate URL response
         assert "task" in result
         assert "web_urls" in result
         assert "message" in result
-        assert "monitoring" in result
+        assert "monitoring" not in result
         assert result["task"] == mock_task_result
-        assert result["monitoring"]["enabled"] is False
         assert "task_detail" in result["web_urls"]
         assert "project_tasks" in result["web_urls"]
         assert f"#{task_id}" in result["message"]
@@ -523,7 +543,7 @@ class TestTaskTools:
             arguments=None,
             inventory_id=None,
         )
-        task_tools._monitor_task_startup.assert_called_once_with(project_id, task_id)
+        task_tools._monitor_task_startup.assert_called_once_with(project_id, task_id, timeout=True)
 
         # Check the result contains both the task and monitoring data
         assert "task" in result
@@ -581,9 +601,8 @@ class TestTaskTools:
         task_tools.semaphore.list_tasks.return_value = mock_task_list
 
         # Run monitoring
-        result = await task_tools._monitor_task_startup(project_id, task_id)
+        result = await task_tools._monitor_task_startup(project_id, task_id, timeout=10)
 
-        # Verify it used the fallback and found the task
         assert result["completed"] is True or result["total_polls"] >= 1
 
         # Check that it found the task via task list if it used fallback
@@ -607,7 +626,7 @@ class TestTaskTools:
         task_tools.semaphore.list_tasks.return_value = []  # Empty task list
 
         # Run monitoring
-        result = await task_tools._monitor_task_startup(project_id, task_id)
+        result = await task_tools._monitor_task_startup(project_id, task_id, timeout=10)
 
         # Should have failed due to consecutive errors
         assert result["consecutive_errors"] > 0
@@ -630,7 +649,7 @@ class TestTaskTools:
         task_tools.semaphore.get_task_raw_output.return_value = "test output"
 
         # Run monitoring
-        result = await task_tools._monitor_task_startup(project_id, task_id)
+        result = await task_tools._monitor_task_startup(project_id, task_id, timeout=10)
 
         # Should have completed successfully
         assert result["completed"] is True
@@ -648,7 +667,7 @@ class TestTaskTools:
         task_tools.semaphore.get_task.return_value = mock_task
 
         # Run monitoring
-        result = await task_tools._monitor_task_startup(project_id, task_id)
+        result = await task_tools._monitor_task_startup(project_id, task_id, timeout=6)
 
         # Should have completed monitoring without task finishing
         assert result["completed"] is False
@@ -667,9 +686,8 @@ class TestTaskTools:
         task_tools.semaphore.get_task.side_effect = mock_error
 
         # Run monitoring
-        result = await task_tools._monitor_task_startup(project_id, task_id)
+        result = await task_tools._monitor_task_startup(project_id, task_id, timeout=10)
 
-        # Should have handled the connection error
         assert result["consecutive_errors"] > 0
 
         # Check error messages
