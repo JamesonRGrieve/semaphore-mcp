@@ -133,6 +133,9 @@ class SemaphoreMCPServer:
         self.mcp.tool()(self.task_tools.confirm_task)
         self.mcp.tool()(self.task_tools.reject_task)
 
+        # tofu state rm over the pipeline (CLI-only op, not a REST bridge)
+        self.mcp.tool()(self.task_tools.run_tofu_state_rm)
+
         # Enhanced task tools - filtering and bulk operations
         self.mcp.tool()(self.task_tools.filter_tasks)
         self.mcp.tool()(self.task_tools.stop_task)
@@ -187,9 +190,7 @@ class SemaphoreMCPServer:
         """
         logger.info(f"Starting MCPServer server for SemaphoreUI at {self.url}")
         if transport == "http":
-            logger.info(
-                f"HTTP transport on {self.host}:{self.port}"
-            )
+            logger.info(f"HTTP transport on {self.host}:{self.port}")
             self.mcp.run(transport="streamable-http", host=self.host, port=self.port)
         else:
             logger.info("STDIO transport")

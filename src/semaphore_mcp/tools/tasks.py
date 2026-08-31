@@ -29,6 +29,23 @@ _ERROR_RE = re.compile(r"^\s*Error:\s")
 # so clamp it defensively rather than let a long description sink the task.
 SEMAPHORE_MESSAGE_MAX = 250
 
+# Semaphore's DELETE /tasks/{id} handler refuses (HTTP 400, empty body — the
+# server comment reads "task must be stopped firstly") while the task is still
+# in the runner's in-memory task pool, i.e. any non-terminal status. A task must
+# reach one of the terminal states below before it can be deleted.
+TASK_TERMINAL_STATES = frozenset(
+    {"success", "successful", "error", "failed", "stopped"}
+)
+
+# Non-terminal statuses that a plain stop_task clears (the task is queued or
+# executing, not parked awaiting a confirm/reject decision).
+TASK_ACTIVE_POOL_STATES = frozenset({"waiting", "starting", "running", "stopping"})
+
+# A parked plan awaiting the confirm/reject gate. It is still in the pool, so it
+# also blocks deletion, but the correct primitive to clear it is reject_task,
+# not stop_task.
+TASK_PARKED_STATE = "waiting_confirmation"
+
 
 def _extract_error_blocks(clean: str) -> list[str]:
     """Extract full error blocks from ANSI-stripped output.
@@ -96,6 +113,7 @@ def _compact_plan_output(raw: str) -> str:
     if out:
         return "\n".join(out)
     return clean.strip()
+
 
 logger = logging.getLogger(__name__)
 
@@ -460,11 +478,15 @@ class TaskTools(BaseTool):
                     if final_status in ["success", "successful"]:
                         response["message"] = f"Task #{task_id} completed successfully!"
                     elif final_status == "waiting_confirmation":
-                        response["message"] = f"Task #{task_id} plan ready — waiting for confirm/reject."
+                        response["message"] = (
+                            f"Task #{task_id} plan ready — waiting for confirm/reject."
+                        )
                     elif final_status in ["error", "failed"]:
                         response["message"] = f"Task #{task_id} failed."
                     else:
-                        response["message"] = f"Task #{task_id} finished with status: {final_status}"
+                        response["message"] = (
+                            f"Task #{task_id} finished with status: {final_status}"
+                        )
                 else:
                     response["message"] = (
                         f"Task #{task_id} still running after {follow}s timeout."
@@ -535,22 +557,159 @@ class TaskTools(BaseTool):
         except Exception as e:
             self.handle_error(e, f"stopping task {task_id}")
 
-    async def delete_task(self, project_id: int, task_id: int) -> dict[str, Any]:
-        """Delete a queued/waiting task that was created erroneously.
+    async def _wait_for_task_terminal(
+        self, project_id: int, task_id: int, timeout: int = 30, poll_interval: int = 2
+    ) -> dict[str, Any]:
+        """Poll a task until it leaves Semaphore's active pool (terminal status).
 
-        Use this to remove tasks stuck in 'waiting' (queued, not yet running)
-        state. For tasks in 'waiting_confirmation' (parked plans), use
-        reject_task instead. For running tasks, use stop_task first.
+        Used before deleting a task that had to be stopped/rejected first: the
+        DELETE endpoint only succeeds once the task has reached a terminal
+        status and been removed from the in-memory pool.
+
+        Args:
+            project_id: Project ID
+            task_id: Task ID to poll
+            timeout: Max seconds to wait for a terminal status
+            poll_interval: Seconds between polls
+
+        Returns:
+            {"status": <last status>, "terminal": bool}. terminal is True if the
+            task reached a terminal status (or 404'd, i.e. already gone).
+        """
+        deadline = time.time() + timeout
+        last_status: Optional[str] = None
+        while True:
+            try:
+                task = self.semaphore.get_task(project_id, task_id)
+            except requests.exceptions.HTTPError as e:
+                # Already gone — treat as terminal for deletion purposes.
+                if "404" in str(e):
+                    return {"status": "deleted", "terminal": True}
+                raise
+            last_status = task.get("status")
+            if last_status in TASK_TERMINAL_STATES:
+                return {"status": last_status, "terminal": True}
+            if time.time() >= deadline:
+                return {"status": last_status, "terminal": False}
+            await asyncio.sleep(poll_interval)
+
+    async def delete_task(
+        self,
+        project_id: int,
+        task_id: int,
+        stop_if_active: bool = True,
+        wait_timeout: int = 30,
+    ) -> dict[str, Any]:
+        """Delete a task and its output, stopping it first if it is still active.
+
+        Semaphore refuses to delete any task that is still in the runner's
+        in-memory pool (a non-terminal status), returning an opaque HTTP 400.
+        This includes the common case of a task stuck in 'waiting' (queued but
+        not yet started). To make deletion reliable, this tool first inspects
+        the task's status and, when ``stop_if_active`` is set, drives it to a
+        terminal state before deleting:
+
+          - 'waiting' / 'starting' / 'running' / 'stopping' -> stop_task, wait
+            for it to reach 'stopped', then delete.
+          - 'waiting_confirmation' (a parked plan) -> reject_task, wait, then
+            delete. (reject_task, not stop, is what clears the confirm gate.)
+          - 'success' / 'error' / 'stopped' -> delete directly.
 
         Args:
             project_id: ID of the project
             task_id: ID of the task to delete
+            stop_if_active: When True (default), stop or reject an active task
+                first so it can be deleted. When False, an active task is left
+                untouched and a message explains it must be stopped first.
+            wait_timeout: Max seconds to wait for a stopped/rejected task to
+                reach a terminal state before deleting (default 30).
 
         Returns:
-            Task delete result
+            Delete result including whether the task had to be stopped first.
         """
         try:
-            return self.semaphore.delete_task(project_id, task_id)
+            # Learn the current status so an active task can be cleared first.
+            try:
+                task = self.semaphore.get_task(project_id, task_id)
+            except requests.exceptions.HTTPError as e:
+                if "404" in str(e):
+                    return {
+                        "task_id": task_id,
+                        "deleted": False,
+                        "message": (
+                            f"Task #{task_id} not found — already deleted or "
+                            "never existed."
+                        ),
+                    }
+                raise
+            status = task.get("status")
+
+            cleared_via: Optional[str] = None
+            if status in TASK_TERMINAL_STATES or status is None:
+                pass  # Already deletable.
+            elif status == TASK_PARKED_STATE:
+                if not stop_if_active:
+                    return {
+                        "task_id": task_id,
+                        "deleted": False,
+                        "status": status,
+                        "message": (
+                            f"Task #{task_id} is a parked plan "
+                            "(waiting_confirmation) and cannot be deleted while "
+                            "it holds the confirm gate. Reject it with "
+                            "reject_task first, or call delete_task with "
+                            "stop_if_active=True."
+                        ),
+                    }
+                self.semaphore.reject_task(project_id, task_id)
+                cleared_via = "reject"
+            elif status in TASK_ACTIVE_POOL_STATES:
+                if not stop_if_active:
+                    return {
+                        "task_id": task_id,
+                        "deleted": False,
+                        "status": status,
+                        "message": (
+                            f"Task #{task_id} is '{status}' (still in "
+                            "Semaphore's active queue) and cannot be deleted "
+                            "until it is stopped. Call delete_task with "
+                            "stop_if_active=True, or stop_task first."
+                        ),
+                    }
+                self.semaphore.stop_task(project_id, task_id)
+                cleared_via = "stop"
+            elif stop_if_active:
+                # Unknown/transitional status — best-effort stop before delete.
+                self.semaphore.stop_task(project_id, task_id)
+                cleared_via = "stop"
+
+            if cleared_via is not None:
+                wait = await self._wait_for_task_terminal(
+                    project_id, task_id, timeout=wait_timeout
+                )
+                if not wait["terminal"]:
+                    return {
+                        "task_id": task_id,
+                        "deleted": False,
+                        "status": wait["status"],
+                        "cleared_via": cleared_via,
+                        "message": (
+                            f"Task #{task_id} was sent a {cleared_via} but did "
+                            f"not reach a terminal state within {wait_timeout}s "
+                            f"(status: {wait['status']}); not deleted. Retry "
+                            "delete once it settles."
+                        ),
+                    }
+
+            result = self.semaphore.delete_task(project_id, task_id)
+            suffix = f" (after {cleared_via})" if cleared_via else ""
+            return {
+                "task_id": task_id,
+                "deleted": True,
+                "cleared_via": cleared_via,
+                "message": f"Task #{task_id} deleted{suffix}.",
+                "result": result,
+            }
         except Exception as e:
             self.handle_error(e, f"deleting task {task_id}")
 
@@ -597,11 +756,15 @@ class TaskTools(BaseTool):
             if monitoring.get("completed"):
                 final_status = monitoring.get("final_status")
                 if final_status in ("success", "successful"):
-                    response["message"] = f"Task #{task_id} apply completed successfully."
+                    response["message"] = (
+                        f"Task #{task_id} apply completed successfully."
+                    )
                 elif final_status in ("error", "failed"):
                     response["message"] = f"Task #{task_id} apply failed."
                 else:
-                    response["message"] = f"Task #{task_id} finished with status: {final_status}"
+                    response["message"] = (
+                        f"Task #{task_id} finished with status: {final_status}"
+                    )
             else:
                 response["message"] = (
                     f"Task #{task_id} apply still running after {follow}s timeout."
@@ -630,6 +793,159 @@ class TaskTools(BaseTool):
             return self.semaphore.reject_task(project_id, task_id)
         except Exception as e:
             self.handle_error(e, f"rejecting task {task_id}")
+
+    async def _resolve_state_rm_template(
+        self, project_id: int, template_name: str
+    ) -> Optional[int]:
+        """Find a bash utility template by name in a project (for state-rm).
+
+        Returns the template id of the first template whose name matches
+        ``template_name`` (case-insensitive), or None if none is found.
+        """
+        templates = self.semaphore.list_templates(project_id)
+        template_list = (
+            templates if isinstance(templates, list) else templates.get("templates", [])
+        )
+        for tmpl in template_list:
+            if tmpl.get("name", "").lower() == template_name.lower():
+                return tmpl.get("id")
+        return None
+
+    async def run_tofu_state_rm(
+        self,
+        tofu_root: str,
+        addresses: list[str],
+        remove: bool = False,
+        project_id: Optional[int] = None,
+        template_id: Optional[int] = None,
+        template_name: str = "state-rm",
+        message: Optional[str] = None,
+        follow: int = 600,
+    ) -> dict[str, Any]:
+        """Run a `tofu state rm` over the sanctioned Semaphore pipeline.
+
+        `tofu state rm` is a CLI-only operation — Semaphore's tofu app only
+        runs init/plan/apply/destroy, so there is no REST endpoint for it. This
+        tool instead drives a dedicated **bash utility template** whose script
+        runs `tofu init` then `tofu state list`/`tofu state rm` in the chosen
+        root, keeping the operation inside the NetBox->Semaphore pipeline
+        (auditable, using the runner's pg backend creds) rather than a direct
+        CLI hit against shared state.
+
+        The root's own `pg` backend `schema_name` isolates its state, so
+        `tofu_root` fully determines which state is touched.
+
+        SAFETY: defaults to a **list-only preview** (`remove=False`) — it shows
+        which state entries match the given addresses without removing anything.
+        Set `remove=True` to actually remove them. Removal is irreversible for
+        the state entry (the real resource is left untouched — this only makes
+        tofu forget it), so preview first.
+
+        Utility template contract (bash app, `allow_override_args_in_task`):
+        the script receives, as CLI arguments, `<tofu_root> <mode> <address...>`
+        where mode is `list` or `rm`. A reference implementation ships with this
+        server (see ``examples/state_rm.sh``).
+
+        Args:
+            tofu_root: Repo-relative tofu root, e.g. "opentofu/zephyrex".
+            addresses: One or more resource addresses to remove, e.g.
+                ["module.foo.bar", "aws_instance.baz"]. Must be a JSON array of
+                strings, not a single string.
+            remove: False (default) previews the matching state entries only;
+                True performs the `tofu state rm`.
+            project_id: Project ID. If omitted, it is auto-detected from
+                template_id, or defaults to the project of the resolved
+                template.
+            template_id: ID of the state-rm utility template. If omitted, the
+                template is resolved by name (see template_name) within
+                project_id.
+            template_name: Name to resolve the utility template by when
+                template_id is not given (default "state-rm").
+            message: Optional task message/label.
+            follow: Max seconds to wait for the task to finish (default 600).
+
+        Returns:
+            Result including the resolved mode, the task run result, and the
+            (ANSI-stripped) state output showing matched / removed entries.
+        """
+        try:
+            if not tofu_root or not tofu_root.strip():
+                raise ValueError("tofu_root must be a non-empty repo-relative path")
+            if not addresses or not all(
+                isinstance(a, str) and a.strip() for a in addresses
+            ):
+                raise ValueError(
+                    "addresses must be a non-empty list of resource address strings"
+                )
+
+            # Resolve the utility template if not given explicitly.
+            if template_id is None:
+                if project_id is None:
+                    raise ValueError(
+                        "Provide template_id, or project_id so the "
+                        f"'{template_name}' utility template can be resolved by name"
+                    )
+                template_id = await self._resolve_state_rm_template(
+                    project_id, template_name
+                )
+                if template_id is None:
+                    raise RuntimeError(
+                        f"No template named '{template_name}' found in project "
+                        f"{project_id}. Create the bash state-rm utility template "
+                        "(see examples/state_rm.sh) or pass template_id explicitly."
+                    )
+
+            mode = "rm" if remove else "list"
+            arguments = [tofu_root, mode, *addresses]
+            if message is None:
+                joined = ", ".join(addresses)
+                verb = "rm" if remove else "list (preview)"
+                message = f"tofu state {verb}: {joined} in {tofu_root}"
+
+            run_result = await self.run_task(
+                template_id=template_id,
+                project_id=project_id,
+                arguments=arguments,
+                message=message,
+                follow=follow,
+            )
+
+            # Best-effort: attach the state output for the caller to inspect.
+            state_output: Optional[str] = None
+            task_id = run_result.get("task", {}).get("id")
+            resolved_project_id = (
+                run_result.get("task", {}).get("project_id") or project_id
+            )
+            if task_id and resolved_project_id:
+                try:
+                    raw = self.semaphore.get_task_raw_output(
+                        resolved_project_id, task_id
+                    )
+                    state_output = _ANSI_RE.sub("", raw).strip()
+                except Exception:
+                    pass  # Output not ready or unavailable; run_result still stands.
+
+            summary = (
+                f"PREVIEW ONLY — no state entries were removed. Re-run with "
+                f"remove=True to remove {len(addresses)} address(es) from "
+                f"'{tofu_root}' state."
+                if not remove
+                else f"Requested removal of {len(addresses)} address(es) from "
+                f"'{tofu_root}' state — verify the task output below."
+            )
+
+            return {
+                "mode": mode,
+                "tofu_root": tofu_root,
+                "addresses": addresses,
+                "removed": remove,
+                "template_id": template_id,
+                "summary": summary,
+                "task_run": run_result,
+                "state_output": state_output,
+            }
+        except Exception as e:
+            self.handle_error(e, f"running tofu state rm in {tofu_root}")
 
     async def filter_tasks(
         self,

@@ -175,7 +175,9 @@ class TestTaskTools:
         task_tools.semaphore.run_task.return_value = mock_result
 
         # Call the method
-        result = await task_tools.run_task(template_id, project_id, environment, follow=0)
+        result = await task_tools.run_task(
+            template_id, project_id, environment, follow=0
+        )
 
         # Verify the enhanced result format
         assert "task" in result
@@ -220,9 +222,14 @@ class TestTaskTools:
         """A message within the limit passes through verbatim with no truncation note."""
         task_tools.semaphore.run_task.return_value = {"id": 8, "status": "scheduled"}
 
-        result = await task_tools.run_task(42, 1, message="short plan message", follow=0)
+        result = await task_tools.run_task(
+            42, 1, message="short plan message", follow=0
+        )
 
-        assert task_tools.semaphore.run_task.call_args.kwargs["message"] == "short plan message"
+        assert (
+            task_tools.semaphore.run_task.call_args.kwargs["message"]
+            == "short plan message"
+        )
         assert "message_truncated" not in result
 
     @pytest.mark.asyncio
@@ -287,7 +294,9 @@ class TestTaskTools:
         task_tools.semaphore.run_task.side_effect = http_error
 
         # The method should return an error response
-        result = await task_tools.run_task(template_id, project_id, environment, follow=0)
+        result = await task_tools.run_task(
+            template_id, project_id, environment, follow=0
+        )
 
         # Verify the error response
         assert "error" in result
@@ -378,6 +387,220 @@ class TestTaskTools:
 
         with pytest.raises(RuntimeError):
             await task_tools.reject_task(1, 123)
+
+    @pytest.mark.asyncio
+    async def test_delete_task_terminal_deletes_directly(self, task_tools):
+        """A task already in a terminal state is deleted without stopping."""
+        task_tools.semaphore.get_task.return_value = {"id": 5, "status": "stopped"}
+        task_tools.semaphore.delete_task.return_value = {}
+
+        result = await task_tools.delete_task(1, 5)
+
+        assert result["deleted"] is True
+        assert result["cleared_via"] is None
+        task_tools.semaphore.stop_task.assert_not_called()
+        task_tools.semaphore.reject_task.assert_not_called()
+        task_tools.semaphore.delete_task.assert_called_once_with(1, 5)
+
+    @pytest.mark.asyncio
+    async def test_delete_task_waiting_stops_first(self, task_tools):
+        """A 'waiting' task is stopped, confirmed terminal, then deleted.
+
+        This is the core fix: Semaphore's DELETE endpoint 400s while the task
+        is still queued in the pool, so it must be stopped first.
+        """
+        # First get_task -> waiting (initial status probe); second -> stopped
+        # (the terminal-wait poll after stop_task).
+        task_tools.semaphore.get_task.side_effect = [
+            {"id": 6, "status": "waiting"},
+            {"id": 6, "status": "stopped"},
+        ]
+        task_tools.semaphore.delete_task.return_value = {}
+
+        result = await task_tools.delete_task(1, 6)
+
+        assert result["deleted"] is True
+        assert result["cleared_via"] == "stop"
+        task_tools.semaphore.stop_task.assert_called_once_with(1, 6)
+        task_tools.semaphore.delete_task.assert_called_once_with(1, 6)
+
+    @pytest.mark.asyncio
+    async def test_delete_task_waiting_confirmation_rejects_first(self, task_tools):
+        """A parked plan (waiting_confirmation) is rejected, not stopped, then deleted."""
+        task_tools.semaphore.get_task.side_effect = [
+            {"id": 7, "status": "waiting_confirmation"},
+            {"id": 7, "status": "error"},
+        ]
+        task_tools.semaphore.delete_task.return_value = {}
+
+        result = await task_tools.delete_task(1, 7)
+
+        assert result["deleted"] is True
+        assert result["cleared_via"] == "reject"
+        task_tools.semaphore.reject_task.assert_called_once_with(1, 7)
+        task_tools.semaphore.stop_task.assert_not_called()
+        task_tools.semaphore.delete_task.assert_called_once_with(1, 7)
+
+    @pytest.mark.asyncio
+    async def test_delete_task_active_without_stop_flag(self, task_tools):
+        """With stop_if_active=False, an active task is left untouched, not deleted."""
+        task_tools.semaphore.get_task.return_value = {"id": 8, "status": "waiting"}
+
+        result = await task_tools.delete_task(1, 8, stop_if_active=False)
+
+        assert result["deleted"] is False
+        assert result["status"] == "waiting"
+        task_tools.semaphore.stop_task.assert_not_called()
+        task_tools.semaphore.delete_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_task_not_found(self, task_tools):
+        """A 404 on the status probe reports the task as already gone."""
+        task_tools.semaphore.get_task.side_effect = requests.exceptions.HTTPError(
+            "Resource not found (404)"
+        )
+
+        result = await task_tools.delete_task(1, 9)
+
+        assert result["deleted"] is False
+        assert "not found" in result["message"]
+        task_tools.semaphore.delete_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_task_stop_timeout_does_not_delete(self, task_tools):
+        """If a stopped task never reaches a terminal state, deletion is skipped."""
+        # Stays 'waiting' on both the probe and the single wait poll; wait_timeout=0
+        # forces the wait loop to give up after one poll without sleeping.
+        task_tools.semaphore.get_task.side_effect = [
+            {"id": 10, "status": "waiting"},
+            {"id": 10, "status": "waiting"},
+        ]
+
+        result = await task_tools.delete_task(1, 10, wait_timeout=0)
+
+        assert result["deleted"] is False
+        assert result["cleared_via"] == "stop"
+        task_tools.semaphore.stop_task.assert_called_once_with(1, 10)
+        task_tools.semaphore.delete_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_task_error(self, task_tools):
+        """delete_task surfaces API errors via handle_error."""
+        task_tools.semaphore.get_task.return_value = {"id": 11, "status": "stopped"}
+        task_tools.semaphore.delete_task.side_effect = requests.exceptions.HTTPError(
+            "500 Server Error"
+        )
+
+        with pytest.raises(RuntimeError):
+            await task_tools.delete_task(1, 11)
+
+    @pytest.mark.asyncio
+    async def test_run_tofu_state_rm_preview_default(self, task_tools):
+        """Defaults to a list-only preview: mode 'list', nothing removed."""
+        task_tools.run_task = AsyncMock(
+            return_value={"task": {"id": 99, "project_id": 1}}
+        )
+        task_tools.semaphore.get_task_raw_output.return_value = "module.foo.bar\n"
+
+        result = await task_tools.run_tofu_state_rm(
+            tofu_root="opentofu/zephyrex",
+            addresses=["module.foo.bar"],
+            template_id=42,
+            project_id=1,
+        )
+
+        assert result["mode"] == "list"
+        assert result["removed"] is False
+        assert "PREVIEW ONLY" in result["summary"]
+        # Arguments passed to the utility script: <root> <mode> <address...>
+        call_kwargs = task_tools.run_task.call_args.kwargs
+        assert call_kwargs["arguments"] == [
+            "opentofu/zephyrex",
+            "list",
+            "module.foo.bar",
+        ]
+        assert call_kwargs["template_id"] == 42
+        assert result["state_output"] == "module.foo.bar"
+
+    @pytest.mark.asyncio
+    async def test_run_tofu_state_rm_remove(self, task_tools):
+        """remove=True switches the script mode to 'rm'."""
+        task_tools.run_task = AsyncMock(
+            return_value={"task": {"id": 100, "project_id": 1}}
+        )
+        task_tools.semaphore.get_task_raw_output.return_value = "REMOVED module.foo.bar"
+
+        result = await task_tools.run_tofu_state_rm(
+            tofu_root="opentofu/omg",
+            addresses=["module.foo.bar", "aws_x.y"],
+            remove=True,
+            template_id=7,
+        )
+
+        assert result["mode"] == "rm"
+        assert result["removed"] is True
+        call_kwargs = task_tools.run_task.call_args.kwargs
+        assert call_kwargs["arguments"] == [
+            "opentofu/omg",
+            "rm",
+            "module.foo.bar",
+            "aws_x.y",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_run_tofu_state_rm_resolves_template_by_name(self, task_tools):
+        """When template_id is omitted, the template is resolved by name."""
+        task_tools.semaphore.list_templates.return_value = [
+            {"id": 3, "name": "update-lab", "app": "bash"},
+            {"id": 55, "name": "state-rm", "app": "bash"},
+        ]
+        task_tools.run_task = AsyncMock(
+            return_value={"task": {"id": 101, "project_id": 1}}
+        )
+        task_tools.semaphore.get_task_raw_output.return_value = ""
+
+        result = await task_tools.run_tofu_state_rm(
+            tofu_root="opentofu/zephyrex",
+            addresses=["module.foo.bar"],
+            project_id=1,
+        )
+
+        assert result["template_id"] == 55
+        assert task_tools.run_task.call_args.kwargs["template_id"] == 55
+
+    @pytest.mark.asyncio
+    async def test_run_tofu_state_rm_no_template_found(self, task_tools):
+        """A missing state-rm template is a clear error, not a silent no-op."""
+        task_tools.semaphore.list_templates.return_value = [
+            {"id": 1, "name": "zephyrex", "app": "tofu"},
+        ]
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await task_tools.run_tofu_state_rm(
+                tofu_root="opentofu/zephyrex",
+                addresses=["module.foo.bar"],
+                project_id=1,
+            )
+        assert "state-rm" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_run_tofu_state_rm_rejects_empty_addresses(self, task_tools):
+        """An empty address list is rejected before any task is run."""
+        with pytest.raises(RuntimeError):
+            await task_tools.run_tofu_state_rm(
+                tofu_root="opentofu/zephyrex",
+                addresses=[],
+                template_id=42,
+            )
+
+    @pytest.mark.asyncio
+    async def test_run_tofu_state_rm_requires_template_or_project(self, task_tools):
+        """Without template_id or project_id the tool cannot resolve a template."""
+        with pytest.raises(RuntimeError):
+            await task_tools.run_tofu_state_rm(
+                tofu_root="opentofu/zephyrex",
+                addresses=["module.foo.bar"],
+            )
 
     @pytest.mark.asyncio
     async def test_bulk_stop_tasks_confirmation(self, task_tools):
@@ -543,7 +766,9 @@ class TestTaskTools:
             arguments=None,
             inventory_id=None,
         )
-        task_tools._monitor_task_startup.assert_called_once_with(project_id, task_id, timeout=True)
+        task_tools._monitor_task_startup.assert_called_once_with(
+            project_id, task_id, timeout=True
+        )
 
         # Check the result contains both the task and monitoring data
         assert "task" in result
