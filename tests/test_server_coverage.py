@@ -81,14 +81,14 @@ class TestSemaphoreMCPServerCoverage:
         """Test the run method logs startup message."""
         server = SemaphoreMCPServer("http://test.example.com", "test-token")
 
-        # Mock the FastMCP run method to avoid actually starting the server
+        # Mock the MCPServer run method to avoid actually starting the server
         with patch.object(server.mcp, "run") as mock_run:
             server.run()
 
             # Check that both log messages were called
             assert mock_logger.info.call_count == 2
             mock_logger.info.assert_any_call(
-                "Starting FastMCP server for SemaphoreUI at http://test.example.com"
+                "Starting MCPServer server for SemaphoreUI at http://test.example.com"
             )
             mock_logger.info.assert_any_call("STDIO transport")
             mock_run.assert_called_once_with(transport="stdio")
@@ -138,18 +138,20 @@ class TestSemaphoreMCPServerCoverage:
             assert server.schedule_tools.semaphore == mock_semaphore
             assert server.view_tools.semaphore == mock_semaphore
 
-    @patch("semaphore_mcp.server.FastMCP")
-    def test_fastmcp_initialization(self, mock_fastmcp_class):
-        """Test FastMCP initialization."""
-        mock_fastmcp_instance = MagicMock()
-        mock_fastmcp_class.return_value = mock_fastmcp_instance
+    @patch("semaphore_mcp.server.MCPServer")
+    def test_mcpserver_initialization(self, mock_mcpserver_class):
+        """Test MCPServer initialization.
+
+        Under the MCP SDK v2 API the host/port are passed to run(), not to the
+        MCPServer constructor (which takes only the server name).
+        """
+        mock_mcpserver_instance = MagicMock()
+        mock_mcpserver_class.return_value = mock_mcpserver_instance
 
         server = SemaphoreMCPServer("http://test.example.com", "test-token")
 
-        mock_fastmcp_class.assert_called_once_with(
-            "semaphore", host="127.0.0.1", port=8000
-        )
-        assert server.mcp == mock_fastmcp_instance
+        mock_mcpserver_class.assert_called_once_with("semaphore")
+        assert server.mcp == mock_mcpserver_instance
 
     def test_tool_registration_methods(self):
         """Test that tool registration calls the correct FastMCP methods."""

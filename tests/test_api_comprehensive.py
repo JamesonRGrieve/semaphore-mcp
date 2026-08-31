@@ -607,48 +607,55 @@ class TestSemaphoreAPIClientComprehensive:
             assert kwargs["json"]["json"] == json.dumps(env_data)
 
     def test_update_environment_name_only(self, mock_client):
-        """Test update_environment method with name only."""
-        mock_response = {"id": 1, "name": "updated"}
+        """Updating only the name preserves the existing env vars.
+
+        update_environment fetches the current environment (GET) then PUTs a
+        merged payload, so a name-only update leaves env untouched.
+        """
+        current = {"id": 1, "name": "old", "json": "{}", "env": '{"KEEP": "1"}'}
+        put_response: dict = {}
         with patch.object(
-            mock_client, "_request", return_value=mock_response
+            mock_client, "_request", side_effect=[current, put_response]
         ) as mock_request:
             result = mock_client.update_environment(1, 1, "updated")
-            assert result == mock_response
-            # Verify only name was updated
-            args, kwargs = mock_request.call_args
-            assert "json" in kwargs
-            assert kwargs["json"]["name"] == "updated"
-            assert "json" not in kwargs["json"]  # env_data not included
+            assert result == put_response
+            get_call, put_call = mock_request.call_args_list
+            assert get_call.args[0] == "GET"
+            assert put_call.args[0] == "PUT"
+            payload = put_call.kwargs["json"]
+            assert payload["name"] == "updated"
+            # No env_data given -> existing env vars are preserved untouched.
+            assert payload["env"] == '{"KEEP": "1"}'
 
     def test_update_environment_data_only(self, mock_client):
-        """Test update_environment method with env_data only."""
-        mock_response = {"id": 1, "name": "test"}
+        """Updating only env_data merges into (does not replace) existing env vars."""
+        current = {"id": 1, "name": "test", "json": "{}", "env": '{"KEEP": "1"}'}
+        put_response: dict = {}
         env_data = {"VAR1": "value1"}
         with patch.object(
-            mock_client, "_request", return_value=mock_response
+            mock_client, "_request", side_effect=[current, put_response]
         ) as mock_request:
             result = mock_client.update_environment(1, 1, env_data=env_data)
-            assert result == mock_response
-            # Verify env_data was JSON encoded
-            args, kwargs = mock_request.call_args
-            assert "json" in kwargs
-            assert kwargs["json"]["json"] == json.dumps(env_data)
-            assert "name" not in kwargs["json"]  # name not included
+            assert result == put_response
+            payload = mock_request.call_args_list[1].kwargs["json"]
+            # Name is preserved from the current environment when not passed.
+            assert payload["name"] == "test"
+            # Merge: existing KEEP retained, VAR1 added.
+            assert json.loads(payload["env"]) == {"KEEP": "1", "VAR1": "value1"}
 
     def test_update_environment_both(self, mock_client):
-        """Test update_environment method with both name and env_data."""
-        mock_response = {"id": 1, "name": "updated"}
+        """Updating both sets the name and merges env_data into existing env vars."""
+        current = {"id": 1, "name": "old", "json": "{}", "env": "{}"}
+        put_response: dict = {}
         env_data = {"VAR1": "value1"}
         with patch.object(
-            mock_client, "_request", return_value=mock_response
+            mock_client, "_request", side_effect=[current, put_response]
         ) as mock_request:
             result = mock_client.update_environment(1, 1, "updated", env_data)
-            assert result == mock_response
-            # Verify both were included
-            args, kwargs = mock_request.call_args
-            assert "json" in kwargs
-            assert kwargs["json"]["name"] == "updated"
-            assert kwargs["json"]["json"] == json.dumps(env_data)
+            assert result == put_response
+            payload = mock_request.call_args_list[1].kwargs["json"]
+            assert payload["name"] == "updated"
+            assert json.loads(payload["env"]) == {"VAR1": "value1"}
 
     def test_delete_environment(self, mock_client):
         """Test delete_environment method."""
