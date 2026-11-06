@@ -852,9 +852,16 @@ class SemaphoreAPIClient:
 
         return self._request("POST", f"project/{project_id}/tasks", json=payload)
 
-    def stop_task(self, project_id: int, task_id: int) -> dict[str, Any]:
-        """Stop a running task."""
-        return self._request("POST", f"project/{project_id}/tasks/{task_id}/stop")
+    def stop_task(
+        self, project_id: int, task_id: int, force: bool = False
+    ) -> dict[str, Any]:
+        """Stop a task. force=True is Semaphore's force stop: the task is marked
+        stopped and dropped from the runner pool even if it never acknowledges a
+        graceful stop (a queued task can otherwise hang in 'stopping')."""
+        path = f"project/{project_id}/tasks/{task_id}/stop"
+        if force:
+            return self._request("POST", path, json={"force": True})
+        return self._request("POST", path)
 
     def confirm_task(self, project_id: int, task_id: int) -> dict[str, Any]:
         """Confirm a parked task, applying its plan.

@@ -47,6 +47,12 @@ TASK_ACTIVE_POOL_STATES = frozenset({"waiting", "starting", "running", "stopping
 TASK_PARKED_STATE = "waiting_confirmation"
 
 
+def default_state_rm_message(addresses: list[str], tofu_root: str, remove: bool) -> str:
+    """The default task label for a tofu state list/rm run."""
+    verb = "rm" if remove else "list (preview)"
+    return f"tofu state {verb}: {', '.join(addresses)} in {tofu_root}"
+
+
 def _extract_error_blocks(clean: str) -> list[str]:
     """Extract full error blocks from ANSI-stripped output.
 
@@ -557,48 +563,13 @@ class TaskTools(BaseTool):
         except Exception as e:
             self.handle_error(e, f"stopping task {task_id}")
 
-    async def _wait_for_task_terminal(
-        self, project_id: int, task_id: int, timeout: int = 30, poll_interval: int = 2
-    ) -> dict[str, Any]:
-        """Poll a task until it leaves Semaphore's active pool (terminal status).
-
-        Used before deleting a task that had to be stopped/rejected first: the
-        DELETE endpoint only succeeds once the task has reached a terminal
-        status and been removed from the in-memory pool.
-
-        Args:
-            project_id: Project ID
-            task_id: Task ID to poll
-            timeout: Max seconds to wait for a terminal status
-            poll_interval: Seconds between polls
-
-        Returns:
-            {"status": <last status>, "terminal": bool}. terminal is True if the
-            task reached a terminal status (or 404'd, i.e. already gone).
-        """
-        deadline = time.time() + timeout
-        last_status: Optional[str] = None
-        while True:
-            try:
-                task = self.semaphore.get_task(project_id, task_id)
-            except requests.exceptions.HTTPError as e:
-                # Already gone — treat as terminal for deletion purposes.
-                if "404" in str(e):
-                    return {"status": "deleted", "terminal": True}
-                raise
-            last_status = task.get("status")
-            if last_status in TASK_TERMINAL_STATES:
-                return {"status": last_status, "terminal": True}
-            if time.time() >= deadline:
-                return {"status": last_status, "terminal": False}
-            await asyncio.sleep(poll_interval)
-
     async def delete_task(
         self,
         project_id: int,
         task_id: int,
         stop_if_active: bool = True,
         wait_timeout: int = 30,
+        poll_interval: int = 2,
     ) -> dict[str, Any]:
         """Delete a task and its output, stopping it first if it is still active.
 
@@ -609,8 +580,10 @@ class TaskTools(BaseTool):
         the task's status and, when ``stop_if_active`` is set, drives it to a
         terminal state before deleting:
 
-          - 'waiting' / 'starting' / 'running' / 'stopping' -> stop_task, wait
-            for it to reach 'stopped', then delete.
+          - 'waiting' / 'starting' / 'running' -> stop, wait for it to reach
+            'stopped', then delete. If it hangs (a queued task can stick in
+            'stopping'), escalate to Semaphore's force stop.
+          - 'stopping' -> force stop at once (its graceful stop already hung).
           - 'waiting_confirmation' (a parked plan) -> reject_task, wait, then
             delete. (reject_task, not stop, is what clears the confirm gate.)
           - 'success' / 'error' / 'stopped' -> delete directly.
@@ -622,7 +595,8 @@ class TaskTools(BaseTool):
                 first so it can be deleted. When False, an active task is left
                 untouched and a message explains it must be stopped first.
             wait_timeout: Max seconds to wait for a stopped/rejected task to
-                reach a terminal state before deleting (default 30).
+                reach a terminal state before force-stopping it (default 30).
+            poll_interval: Seconds between status polls (default 2).
 
         Returns:
             Delete result including whether the task had to be stopped first.
@@ -644,69 +618,77 @@ class TaskTools(BaseTool):
                 raise
             status = task.get("status")
 
+            # Imported here: task_lifecycle imports this module.
+            from .task_lifecycle import drive_to_terminal
+
             cleared_via: Optional[str] = None
+            forced = False
             if status in TASK_TERMINAL_STATES or status is None:
                 pass  # Already deletable.
-            elif status == TASK_PARKED_STATE:
+            else:
+                if status == TASK_PARKED_STATE:
+                    signal = "reject"
+                    blocked = (
+                        f"Task #{task_id} is a parked plan "
+                        "(waiting_confirmation) and cannot be deleted while "
+                        "it holds the confirm gate. Reject it with "
+                        "reject_task first, or call delete_task with "
+                        "stop_if_active=True."
+                    )
+                else:
+                    signal = "stop"
+                    blocked = (
+                        f"Task #{task_id} is '{status}' (still in "
+                        "Semaphore's active queue) and cannot be deleted "
+                        "until it is stopped. Call delete_task with "
+                        "stop_if_active=True, or stop_task first."
+                    )
                 if not stop_if_active:
                     return {
                         "task_id": task_id,
                         "deleted": False,
                         "status": status,
-                        "message": (
-                            f"Task #{task_id} is a parked plan "
-                            "(waiting_confirmation) and cannot be deleted while "
-                            "it holds the confirm gate. Reject it with "
-                            "reject_task first, or call delete_task with "
-                            "stop_if_active=True."
-                        ),
+                        "message": blocked,
                     }
-                self.semaphore.reject_task(project_id, task_id)
-                cleared_via = "reject"
-            elif status in TASK_ACTIVE_POOL_STATES:
-                if not stop_if_active:
-                    return {
-                        "task_id": task_id,
-                        "deleted": False,
-                        "status": status,
-                        "message": (
-                            f"Task #{task_id} is '{status}' (still in "
-                            "Semaphore's active queue) and cannot be deleted "
-                            "until it is stopped. Call delete_task with "
-                            "stop_if_active=True, or stop_task first."
-                        ),
-                    }
-                self.semaphore.stop_task(project_id, task_id)
-                cleared_via = "stop"
-            elif stop_if_active:
-                # Unknown/transitional status — best-effort stop before delete.
-                self.semaphore.stop_task(project_id, task_id)
-                cleared_via = "stop"
-
-            if cleared_via is not None:
-                wait = await self._wait_for_task_terminal(
-                    project_id, task_id, timeout=wait_timeout
+                outcome = await drive_to_terminal(
+                    self.semaphore,
+                    project_id,
+                    task_id,
+                    status=status,
+                    signal=signal,
+                    wait_timeout=wait_timeout,
+                    force_timeout=wait_timeout,
+                    poll_interval=poll_interval,
                 )
-                if not wait["terminal"]:
+                cleared_via = signal
+                forced = outcome["forced"]
+                if not outcome["terminal"]:
                     return {
                         "task_id": task_id,
                         "deleted": False,
-                        "status": wait["status"],
+                        "status": outcome["status"],
                         "cleared_via": cleared_via,
+                        "forced": forced,
                         "message": (
-                            f"Task #{task_id} was sent a {cleared_via} but did "
-                            f"not reach a terminal state within {wait_timeout}s "
-                            f"(status: {wait['status']}); not deleted. Retry "
-                            "delete once it settles."
+                            f"Task #{task_id} was sent a {cleared_via} and a "
+                            f"force stop but is still '{outcome['status']}'; "
+                            "Semaphore did not release it, so it was not "
+                            "deleted. Its template queue stays blocked until "
+                            "the Semaphore service restarts."
                         ),
                     }
 
             result = self.semaphore.delete_task(project_id, task_id)
-            suffix = f" (after {cleared_via})" if cleared_via else ""
+            suffix = (
+                f" (after {cleared_via}{', forced' if forced else ''})"
+                if cleared_via
+                else ""
+            )
             return {
                 "task_id": task_id,
                 "deleted": True,
                 "cleared_via": cleared_via,
+                "forced": forced,
                 "message": f"Task #{task_id} deleted{suffix}.",
                 "result": result,
             }
@@ -898,9 +880,7 @@ class TaskTools(BaseTool):
             mode = "rm" if remove else "list"
             arguments = [tofu_root, mode, *addresses]
             if message is None:
-                joined = ", ".join(addresses)
-                verb = "rm" if remove else "list (preview)"
-                message = f"tofu state {verb}: {joined} in {tofu_root}"
+                message = default_state_rm_message(addresses, tofu_root, remove)
 
             run_result = await self.run_task(
                 template_id=template_id,

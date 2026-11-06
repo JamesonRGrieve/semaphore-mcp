@@ -19,6 +19,7 @@ from .tools.project_users import ProjectUserTools
 from .tools.projects import ProjectTools
 from .tools.repositories import RepositoryTools
 from .tools.schedules import ScheduleTools
+from .tools.task_lifecycle import TaskLifecycleTools
 from .tools.tasks import TaskTools
 from .tools.templates import TemplateTools
 from .tools.views import ViewTools
@@ -62,6 +63,9 @@ class SemaphoreMCPServer:
         self.project_user_tools = ProjectUserTools(self.semaphore)
         self.template_tools = TemplateTools(self.semaphore)
         self.task_tools = TaskTools(self.semaphore)
+        # Registered start/stop tools: mandatory agent_id on starts, stops that
+        # escalate to a force stop (tools/task_lifecycle.py).
+        self.lifecycle_tools = TaskLifecycleTools(self.semaphore, self.task_tools)
         self.environment_tools = EnvironmentTools(self.semaphore)
         self.repository_tools = RepositoryTools(self.semaphore)
         self.access_key_tools = AccessKeyTools(self.semaphore)
@@ -111,7 +115,7 @@ class SemaphoreMCPServer:
         self.mcp.tool()(self.template_tools.create_template)
         self.mcp.tool()(self.template_tools.update_template)
         self.mcp.tool()(self.template_tools.delete_template)
-        self.mcp.tool()(self.template_tools.stop_all_template_tasks)
+        self.mcp.tool()(self.lifecycle_tools.stop_all_template_tasks)
 
         # Schedule tools
         self.mcp.tool()(self.schedule_tools.list_schedules)
@@ -126,21 +130,21 @@ class SemaphoreMCPServer:
         # Task tools
         self.mcp.tool()(self.task_tools.list_tasks)
         self.mcp.tool()(self.task_tools.get_task)
-        self.mcp.tool()(self.task_tools.run_task)
+        self.mcp.tool()(self.lifecycle_tools.run_task)
         self.mcp.tool()(self.task_tools.get_latest_failed_task)
 
         # Plan-then-apply gate (confirm/reject a parked task)
-        self.mcp.tool()(self.task_tools.confirm_task)
+        self.mcp.tool()(self.lifecycle_tools.confirm_task)
         self.mcp.tool()(self.task_tools.reject_task)
 
         # tofu state rm over the pipeline (CLI-only op, not a REST bridge)
-        self.mcp.tool()(self.task_tools.run_tofu_state_rm)
+        self.mcp.tool()(self.lifecycle_tools.run_tofu_state_rm)
 
         # Enhanced task tools - filtering and bulk operations
         self.mcp.tool()(self.task_tools.filter_tasks)
-        self.mcp.tool()(self.task_tools.stop_task)
+        self.mcp.tool()(self.lifecycle_tools.stop_task)
         self.mcp.tool()(self.task_tools.delete_task)
-        self.mcp.tool()(self.task_tools.bulk_stop_tasks)
+        self.mcp.tool()(self.lifecycle_tools.bulk_stop_tasks)
         self.mcp.tool()(self.task_tools.get_waiting_tasks)
 
         # LLM-based failure analysis tools

@@ -468,20 +468,56 @@ class TestTaskTools:
 
     @pytest.mark.asyncio
     async def test_delete_task_stop_timeout_does_not_delete(self, task_tools):
-        """If a stopped task never reaches a terminal state, deletion is skipped."""
-        # Stays 'waiting' on both the probe and the single wait poll; wait_timeout=0
-        # forces the wait loop to give up after one poll without sleeping.
+        """A task that survives the graceful stop AND the force stop is not deleted."""
+        # Probe, graceful-wait poll, force-wait poll: all 'waiting'. Timeouts of 0
+        # make each wait give up after one poll without sleeping.
         task_tools.semaphore.get_task.side_effect = [
+            {"id": 10, "status": "waiting"},
             {"id": 10, "status": "waiting"},
             {"id": 10, "status": "waiting"},
         ]
 
-        result = await task_tools.delete_task(1, 10, wait_timeout=0)
+        result = await task_tools.delete_task(1, 10, wait_timeout=0, poll_interval=0)
 
         assert result["deleted"] is False
         assert result["cleared_via"] == "stop"
-        task_tools.semaphore.stop_task.assert_called_once_with(1, 10)
+        assert result["forced"] is True
+        task_tools.semaphore.stop_task.assert_any_call(1, 10)
+        task_tools.semaphore.stop_task.assert_any_call(1, 10, force=True)
         task_tools.semaphore.delete_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_task_hung_stop_is_forced_then_deleted(self, task_tools):
+        """A queued task that hangs after the graceful stop is force-stopped, then deleted."""
+        task_tools.semaphore.get_task.side_effect = [
+            {"id": 12, "status": "waiting"},
+            {"id": 12, "status": "stopping"},
+            {"id": 12, "status": "stopped"},
+        ]
+        task_tools.semaphore.delete_task.return_value = {}
+
+        result = await task_tools.delete_task(1, 12, wait_timeout=0, poll_interval=0)
+
+        assert result["deleted"] is True
+        assert result["forced"] is True
+        task_tools.semaphore.stop_task.assert_any_call(1, 12, force=True)
+        task_tools.semaphore.delete_task.assert_called_once_with(1, 12)
+
+    @pytest.mark.asyncio
+    async def test_delete_task_stuck_stopping_is_forced_at_once(self, task_tools):
+        """A task already in 'stopping' (task 5469's case) skips the graceful stop."""
+        task_tools.semaphore.get_task.side_effect = [
+            {"id": 5469, "status": "stopping"},
+            {"id": 5469, "status": "stopped"},
+        ]
+        task_tools.semaphore.delete_task.return_value = {}
+
+        result = await task_tools.delete_task(1, 5469)
+
+        assert result["deleted"] is True
+        assert result["forced"] is True
+        task_tools.semaphore.stop_task.assert_called_once_with(1, 5469, force=True)
+        task_tools.semaphore.delete_task.assert_called_once_with(1, 5469)
 
     @pytest.mark.asyncio
     async def test_delete_task_error(self, task_tools):
