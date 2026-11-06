@@ -6,9 +6,9 @@ upstream TaskTools surface stays rebasable:
 
 1. **Every start names its agent.** run_task, run_tofu_state_rm and
    confirm_task take a mandatory ``agent_id``: the calling session's ListAgents
-   ID (the hex in "This session is <name> [<id>]"). It is stamped into the
-   task message as ``[agent <id>]``, so the owner of any queued or stuck task
-   can be found and messaged.
+   identity ("<name> [<id>]" from "This session is <name> [<id>]", or the bare
+   ID). It signs the task message the way the SOP requires, ``[<name> <id>]
+   ...``, so the owner of any queued or stuck task can be found and messaged.
 
 2. **Stopping works.** A plain ``POST /tasks/{id}/stop`` moves a task to
    'stopping'. A task that was still queued (never started) can then sit in
@@ -44,35 +44,54 @@ logger = logging.getLogger(__name__)
 
 # A ListAgents session ID is short lowercase hex ("c1bd5c"). Accept the bare ID,
 # "[c1bd5c]", or the whole "Name [c1bd5c]" line, so a caller can paste either.
-_AGENT_ID_RE = re.compile(r"(?:^|\[)([0-9a-f]{6,16})\]?$")
-_AGENT_STAMP_RE = re.compile(r"^\[agent ([0-9a-f]{6,16})\]\s*")
+_AGENT_ID_RE = re.compile(r"^(?:(.*?)\s*)?\[?([0-9a-f]{6,16})\]?$")
+# The task-message signature the SOP sets (Pipeline Doctrine -> Sharing the
+# runner): "[<ListAgents name> <id>] PLAN ...", or "[<id>]" when no name is known.
+_SIGNATURE_RE = re.compile(r"^\[(?:([^\[\]]*?)\s+)?([0-9a-f]{6,16})\]\s*")
 
 STOPPING_STATE = "stopping"
 
 
-def normalize_agent_id(agent_id: Any) -> str:
-    """Return the bare ListAgents ID, or raise ValueError naming how to get one."""
-    raw = str(agent_id or "").strip().lower()
-    match = _AGENT_ID_RE.search(raw)
-    if not match:
+def parse_agent(agent_id: Any) -> tuple[str | None, str]:
+    """Return (ListAgents name or None, bare ID), or raise ValueError saying how to get it."""
+    raw = str(agent_id or "").strip()
+    match = _AGENT_ID_RE.match(raw.lower())
+    if not match or (match.group(1) and "[" not in raw):
         raise ValueError(
-            "agent_id is required: pass your session's ListAgents ID (the hex in "
-            "brackets on the first line of ListAgents, 'This session is <name> "
-            f"[<id>]'). Got {agent_id!r}."
+            "agent_id is required: pass your session's ListAgents identity, the "
+            "'<name> [<id>]' from the first line of ListAgents ('This session is "
+            f"<name> [<id>]'), or just the bare <id>. Got {agent_id!r}."
         )
-    return match.group(1)
+    name = raw[: raw.index("[")].strip() if "[" in raw else ""
+    return (name or None), match.group(2)
 
 
-def stamp_message(agent_id: str, message: str | None) -> str:
-    """Prefix a task message with ``[agent <id>]``, replacing any earlier stamp."""
-    body = _AGENT_STAMP_RE.sub("", (message or "").strip())
-    return f"[agent {agent_id}] {body}".strip()
+def normalize_agent_id(agent_id: Any) -> str:
+    """Return the bare ListAgents ID, or raise ValueError."""
+    return parse_agent(agent_id)[1]
+
+
+def stamp_message(agent_id: Any, message: str | None) -> str:
+    """Sign a task message "[<name> <id>] ...", replacing any earlier signature.
+
+    With a bare ID, a name already in the message's own signature for the same
+    ID is kept.
+    """
+    name, ident = parse_agent(agent_id)
+    body = (message or "").strip()
+    existing = _SIGNATURE_RE.match(body)
+    if existing:
+        if name is None and existing.group(2) == ident and existing.group(1):
+            name = existing.group(1).strip()
+        body = body[existing.end() :]
+    signature = f"[{name} {ident}]" if name else f"[{ident}]"
+    return f"{signature} {body}".strip()
 
 
 def agent_of(message: str | None) -> str | None:
-    """The agent ID stamped on a task message, if any."""
-    match = _AGENT_STAMP_RE.match(message or "")
-    return match.group(1) if match else None
+    """The ListAgents ID a task message is signed with, if any."""
+    match = _SIGNATURE_RE.match(message or "")
+    return match.group(2) if match else None
 
 
 async def _poll_terminal(
@@ -180,7 +199,7 @@ class TaskLifecycleTools(BaseTool):
         """Run a task from a template and wait for it to finish.
 
         Args:
-            agent_id: REQUIRED. Your session's ListAgents ID: the hex in brackets on the first line of ListAgents ("This session is <name> [<id>]"). Stamped into the task message as "[agent <id>]" so the task's owner can always be found.
+            agent_id: REQUIRED. Your session's ListAgents identity: "<name> [<id>]" from the first line of ListAgents ("This session is <name> [<id>]"), or the bare <id>. Signs the task message "[<name> <id>] ..." (the SOP signature) so the task's owner can always be found; do not sign the message yourself.
             template_id: ID of the template to run
             project_id: Optional project ID (if not provided, will attempt to determine from template)
             environment: Optional environment variables for the task as dictionary
@@ -190,7 +209,7 @@ class TaskLifecycleTools(BaseTool):
             debug: Enable verbose debug output
             playbook: Override playbook file path
             git_branch: Override git branch to use
-            message: Task description/message (the agent stamp is prepended)
+            message: Task description/message (the signature is prepended)
             arguments: Additional CLI arguments. MUST be a JSON array of strings, NOT a string. Example: ["-target=module.foo", "-refresh=false"].
             inventory_id: Override inventory to use
             follow: Max seconds to wait for a terminal state (success, error, waiting_confirmation); returns as soon as it gets there. 0 = fire and forget (default 600).
@@ -212,7 +231,7 @@ class TaskLifecycleTools(BaseTool):
             debug=debug,
             playbook=playbook,
             git_branch=git_branch,
-            message=stamp_message(agent, message),
+            message=stamp_message(agent_id, message),
             arguments=arguments,
             inventory_id=inventory_id,
             follow=follow,
@@ -239,14 +258,14 @@ class TaskLifecycleTools(BaseTool):
         untouched). Preview first.
 
         Args:
-            agent_id: REQUIRED. Your session's ListAgents ID (the hex in brackets on the first line of ListAgents). Stamped into the task message.
+            agent_id: REQUIRED. Your session's ListAgents identity, "<name> [<id>]" or the bare <id>. Signs the task message.
             tofu_root: Repo-relative tofu root, e.g. "opentofu/zephyrex".
             addresses: Resource addresses, a JSON array of strings.
             remove: False (default) previews only; True removes.
             project_id: Project ID (needed to resolve the template by name).
             template_id: ID of the state-rm utility template.
             template_name: Name to resolve the template by (default "state-rm").
-            message: Optional task label (the agent stamp is prepended).
+            message: Optional task label (the signature is prepended).
             follow: Max seconds to wait for the task to finish (default 600).
 
         Returns:
@@ -264,7 +283,7 @@ class TaskLifecycleTools(BaseTool):
             project_id=project_id,
             template_id=template_id,
             template_name=template_name,
-            message=stamp_message(agent, label),
+            message=stamp_message(agent_id, label),
             follow=follow,
         )
         result["agent_id"] = agent
@@ -282,7 +301,7 @@ class TaskLifecycleTools(BaseTool):
         explicitly allowed.
 
         Args:
-            agent_id: REQUIRED. Your session's ListAgents ID (the hex in brackets on the first line of ListAgents). Recorded as the confirmer.
+            agent_id: REQUIRED. Your session's ListAgents identity, "<name> [<id>]" or the bare <id>. Recorded as the confirmer.
             project_id: ID of the project
             task_id: ID of the parked task to confirm
             follow: Seconds to wait for the apply to finish (default 600). 0 = fire and forget.

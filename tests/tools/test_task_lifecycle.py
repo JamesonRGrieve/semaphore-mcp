@@ -37,14 +37,28 @@ class TestAgentId:
         with pytest.raises(ValueError, match="ListAgents"):
             normalize_agent_id(given)
 
-    def test_stamp_replaces_an_earlier_stamp(self):
-        assert stamp_message("c1bd5c", "PLAN x") == "[agent c1bd5c] PLAN x"
+    def test_signature_follows_the_sop_format(self):
+        assert stamp_message("OMG [c1bd5c]", "PLAN x") == "[OMG c1bd5c] PLAN x"
         assert (
-            stamp_message("c1bd5c", "[agent abcdef] PLAN x") == "[agent c1bd5c] PLAN x"
+            stamp_message("jameson-ba [96661d]", "PLAN x")
+            == "[jameson-ba 96661d] PLAN x"
         )
-        assert stamp_message("c1bd5c", None) == "[agent c1bd5c]"
-        assert agent_of("[agent c1bd5c] PLAN x") == "c1bd5c"
-        assert agent_of("PLAN x") is None
+        assert stamp_message("c1bd5c", "PLAN x") == "[c1bd5c] PLAN x"
+        assert stamp_message("c1bd5c", None) == "[c1bd5c]"
+
+    def test_existing_signature_is_replaced_not_doubled(self):
+        # The agent signed it by hand, as the SOP says: same id keeps its name.
+        assert stamp_message("c1bd5c", "[OMG c1bd5c] PLAN x") == "[OMG c1bd5c] PLAN x"
+        assert (
+            stamp_message("OMG [c1bd5c]", "[jameson-ba 96661d] PLAN x")
+            == "[OMG c1bd5c] PLAN x"
+        )
+        assert stamp_message("c1bd5c", "[agent abcdef] PLAN x") == "[c1bd5c] PLAN x"
+
+    def test_agent_of_reads_the_signature(self):
+        assert agent_of("[jameson-ba 96661d] PLAN x") == "96661d"
+        assert agent_of("[c1bd5c] PLAN x") == "c1bd5c"
+        assert agent_of("PLAN (card 252) x") is None
 
 
 class TestStarts:
@@ -64,7 +78,7 @@ class TestStarts:
             follow=0,
         )
         kwargs = lifecycle.task_tools.run_task.call_args.kwargs
-        assert kwargs["message"] == "[agent c1bd5c] PLAN x"
+        assert kwargs["message"] == "[OMG c1bd5c] PLAN x"
         assert kwargs["follow"] == 0
         assert result["agent_id"] == "c1bd5c"
 
@@ -78,7 +92,7 @@ class TestStarts:
         )
         kwargs = lifecycle.task_tools.run_tofu_state_rm.call_args.kwargs
         assert kwargs["message"] == (
-            "[agent c1bd5c] tofu state list (preview): a.b in opentofu/zephyrex"
+            "[c1bd5c] tofu state list (preview): a.b in opentofu/zephyrex"
         )
 
     @pytest.mark.asyncio
@@ -95,7 +109,9 @@ class TestStarts:
         assert refused["error_type"] == "missing_agent_id"
         lifecycle.task_tools.confirm_task.assert_not_called()
 
-        lifecycle.semaphore.get_task.return_value = {"message": "[agent abcdef] PLAN"}
+        lifecycle.semaphore.get_task.return_value = {
+            "message": "[jameson-ba abcdef] PLAN"
+        }
         result = await lifecycle.confirm_task(
             agent_id="c1bd5c", project_id=1, task_id=9
         )
@@ -108,7 +124,7 @@ class TestStop:
     @pytest.mark.asyncio
     async def test_graceful_stop_that_finishes_is_not_forced(self, lifecycle):
         lifecycle.semaphore.get_task.side_effect = [
-            {"status": "running", "message": "[agent c1bd5c] x"},
+            {"status": "running", "message": "[OMG c1bd5c] x"},
             {"status": "stopped"},
         ]
         result = await lifecycle.stop_task(1, 5, poll_interval=0)
